@@ -8,7 +8,7 @@
 #   scripts/download-model.sh vad        only Silero VAD (1.2 MB; every model above also gets it)
 #
 # Then point `speech_model` in ~/.config/hushnote/config.json at the file (or pick it in the app).
-# The summaries use a local LLM you install separately, for example: ollama pull qwen3:8b
+# The summaries use a local LLM you install separately, for example: ollama pull qwen3:4b-instruct-2507-q4_K_M (or from Home in the app)
 set -euo pipefail
 
 case "${1:-v3}" in

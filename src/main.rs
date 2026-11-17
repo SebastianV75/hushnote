@@ -8,6 +8,8 @@
 mod audio;
 mod config;
 mod llm;
+mod models;
+mod ollama;
 mod segmenter;
 mod session;
 mod store;
@@ -86,7 +88,7 @@ fn transcribe(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if summarize {
-        let llm = llm::Llm { url: config.llm_url.clone(), model: config.llm_model.clone() };
+        let llm = llm::Llm::from_config(&config);
         println!();
         let result = llm.summarize("", &lines, |delta| {
             print!("{delta}");

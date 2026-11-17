@@ -47,11 +47,33 @@ on the machine.** Main target: Linux on Omarchy (Hyprland, Wayland, PipeWire).
   (`stream.capture.sink=true`) = "Them". `--raw` only with PipeWire ≥ 1.3.81 (detected through
   `--help`). Each capture runs in its own process group, and stopping kills the whole group, so
   a wrapper's children can't keep the pipe open and stall the transcript.
-- **Summaries:** a local LLM through an OpenAI-compatible API (`/v1/chat/completions`):
-  Ollama, llama-server or LM Studio. Default `http://localhost:11434/v1`, model `qwen3:8b`.
+- **Summaries:** by default a local LLM through an OpenAI-compatible API
+  (`/v1/chat/completions`): Ollama, llama-server or LM Studio. Default
+  `http://localhost:11434/v1`, model `qwen3:4b-instruct-2507-q4_K_M` (~2.5 GB, ~3–4 GB of RAM
+  only while writing; the smallest that writes reliable notes and task lists in Spanish and
+  English). Not plain `qwen3:4b`: that tag now points at the thinking build, which ignores
+  `/no_think` and reasons for minutes on a CPU. Older configs with `qwen3:4b` are migrated.
+  - Optional, picked in the composer ("Summary · …") or in Home › Set up: **Claude** (the user's
+    subscription, `claude -p` with no tools, no settings and no saved session), **Codex**
+    (`codex exec` read-only, ephemeral, ignoring the user's config) or **OpenCode** (`opencode run
+    --pure --format json`; its free models need no account). These send the transcript to that
+    service, and the UI says so. Each runs in an empty temp folder. Only installed CLIs are
+    offered. `summary_cli_model` picks their model (empty = their default). Tested here: the
+    same Spanish meeting summarized correctly by all three (Claude ~6 s, Codex and OpenCode
+    ~18 s).
   Prompts are in English; the summary is written in the meeting's language, as
   `## Decisions`, `## Action items` (`- [ ] Owner does the task · due`) and
-  `## Open questions`. Long meetings are summarized in parts; `<think>` blocks are filtered.
+  `## Open questions`. With the local model long meetings are summarized in parts; the hosted
+  ones take the whole meeting. `<think>` blocks are filtered.
+- **Languages (for now Spanish and English):** the composer's language picker also picks the
+  speech model, as Hex recommends: Spanish → Parakeet v3, English → Parakeet Unified English.
+  Switching to one that isn't downloaded offers its one-click Download.
+- **One-click setup (Home › Set up), as in Hex:** the speech model downloads from the app
+  (resumable, sha256-checked, with progress and Cancel; Silero VAD comes along), and the
+  composer offers Download instead of Record while it is missing. The summary model is pulled
+  through Ollama's `/api/pull` with progress; if Ollama isn't running, Home says how to start it
+  (`sudo pacman -S ollama && sudo systemctl enable --now ollama`). `src/models.rs`,
+  `src/ollama.rs`.
 - **Storage:** one Markdown file per meeting in `~/Documents/Hushnote` (or `~/Hushnote`), with
   sections marked `<!-- hushnote:notes -->`, `<!-- hushnote:summary -->` and
   `<!-- hushnote:transcript -->` so it can be read back.

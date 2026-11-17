@@ -9,7 +9,7 @@
 //! and the last phrase (on Wayland it is a layer-shell surface and takes no clicks).
 
 use crate::audio::Speaker;
-use crate::config::{self, Config};
+use crate::config::{Config, Summaries};
 use crate::llm::{Llm, clock};
 use crate::session::{Event, Line, Recording};
 use crate::store::{self, Meeting};
@@ -19,7 +19,10 @@ use rune::{
     Waker, col, el, icon, row, text, text_input,
 };
 use rune_kit::{Markdown, MarkdownStyle};
+use crate::{models, ollama};
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -86,34 +89,8 @@ const METER_BARS: usize = 5;
 const AUTOSAVE_S: f64 = 2.0;
 const COLUMN: f32 = 720.0;
 
-const LANGUAGES: [(&str, &str); 8] = [
-    ("", "Auto-detect"),
-    ("en", "English"),
-    ("es", "Spanish"),
-    ("pt", "Portuguese"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("it", "Italian"),
-    ("nl", "Dutch"),
-];
-
 fn language_label(code: &str) -> String {
-    LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, l)| l.to_string()).unwrap_or_else(|| code.to_uppercase())
-}
-
-fn model_label(path: &Path) -> String {
-    let name = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if name.contains("parakeet") && name.contains("v3") {
-        "Parakeet v3".into()
-    } else if name.contains("parakeet") && name.contains("v2") {
-        "Parakeet v2".into()
-    } else if name.contains("parakeet-unified-en") {
-        "Parakeet English".into()
-    } else if name.contains("whisper-large-v3-turbo") {
-        "Whisper turbo".into()
-    } else {
-        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into())
-    }
+    models::LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, l)| l.to_string()).unwrap_or_else(|| code.to_uppercase())
 }
 
 /// `/home/me/Documents/Hushnote` → `~/Documents/Hushnote`.
@@ -166,6 +143,26 @@ enum LlmMsg {
     Delta(PathBuf, String),
     Done(PathBuf, Result<String, String>),
     Title(PathBuf, String),
+    State(ollama::State),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Fetch {
+    Speech,
+    Llm,
+}
+
+/// A one-click download in progress (a speech model, or the summary model through Ollama).
+struct Download {
+    what: Fetch,
+    have: u64,
+    total: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+enum DlMsg {
+    Progress(u64, u64),
+    Done(Fetch, Result<String, String>),
 }
 
 struct Meters {
@@ -215,6 +212,12 @@ pub struct Ui {
     demo: bool,
     capsule: Option<OverlayHandle<Capsule>>,
     capsule_shown: (String, String),
+    download: Option<Download>,
+    dl: (Sender<DlMsg>, Receiver<DlMsg>),
+    /// Whether the summary model is there (`None` while it is being checked).
+    llm_state: Option<ollama::State>,
+    /// Screenshot scenes decide this instead of the disk.
+    speech_ready_override: Option<bool>,
 }
 
 impl Ui {
@@ -243,17 +246,115 @@ impl Ui {
             demo: false,
             capsule,
             capsule_shown: Default::default(),
+            download: None,
+            dl: mpsc::channel(),
+            llm_state: None,
+            speech_ready_override: None,
         };
         if let Some(m) = ui.current() {
             ui.view = default_view(m);
         }
-        if !ui.config.speech_model.exists() {
-            ui.status = Some((
-                format!("Speech model missing at {}. Run scripts/download-model.sh.", tilde(&ui.config.speech_model)),
-                true,
-            ));
-        }
         ui
+    }
+
+    fn speech_ready(&self) -> bool {
+        self.speech_ready_override.unwrap_or_else(|| self.config.speech_model.exists())
+    }
+
+    /// The catalog entry for the configured model (the language's for a path outside it).
+    fn speech_artifact(&self) -> &'static models::Artifact {
+        models::for_path(&self.config.speech_model).unwrap_or_else(|| models::for_language(&self.config.language))
+    }
+
+    /// Whether summaries can be written now: Ollama has the model, or the CLI is installed.
+    fn summaries_ready(&self) -> bool {
+        match self.config.summaries {
+            Summaries::Local => self.llm_state == Some(ollama::State::Ready),
+            p => self.demo || p.installed(),
+        }
+    }
+
+    /// Whether Home should offer to set up summaries (not while Ollama is still being asked).
+    fn summaries_need_setup(&self) -> bool {
+        match self.config.summaries {
+            Summaries::Local => matches!(self.llm_state, Some(ollama::State::Missing | ollama::State::NotRunning)),
+            _ => !self.summaries_ready(),
+        }
+    }
+
+    /// Downloads the configured speech model (and Silero VAD) in the background.
+    fn download_speech(&mut self) {
+        if self.download.is_some() || self.demo {
+            return;
+        }
+        let artifact = self.speech_artifact();
+        if models::for_path(&self.config.speech_model).is_none() {
+            self.config.speech_model = artifact.path();
+            self.save_config();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.download = Some(Download { what: Fetch::Speech, have: 0, total: artifact.bytes, cancel: cancel.clone() });
+        self.status = None;
+        let (tx, wake) = (self.dl.0.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let mut shown = 0u64;
+            let result = artifact
+                .download(&cancel, |have, total| {
+                    if have - shown >= total / 300 || have == total {
+                        shown = have;
+                        let _ = tx.send(DlMsg::Progress(have, total));
+                        wake();
+                    }
+                })
+                .and_then(|_| models::VAD.download(&cancel, |_, _| {}))
+                .map(|_| format!("{} is ready. Press New meeting to start.", artifact.name));
+            let _ = tx.send(DlMsg::Done(Fetch::Speech, result));
+            wake();
+        });
+    }
+
+    /// Pulls the summary model through Ollama in the background.
+    fn download_llm(&mut self) {
+        if self.download.is_some() || self.demo {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.download = Some(Download { what: Fetch::Llm, have: 0, total: 0, cancel });
+        let (url, model) = (self.config.llm_url.clone(), self.config.llm_model.clone());
+        let (tx, wake) = (self.dl.0.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let mut shown = 0u64;
+            let result = ollama::pull(&url, &model, |have, total| {
+                if have.abs_diff(shown) >= total / 300 || have == total {
+                    shown = have;
+                    let _ = tx.send(DlMsg::Progress(have, total));
+                    wake();
+                }
+            })
+            .map(|_| format!("{model} is ready for summaries."));
+            let _ = tx.send(DlMsg::Done(Fetch::Llm, result));
+            wake();
+        });
+    }
+
+    fn cancel_download(&mut self) {
+        if let Some(d) = &self.download {
+            d.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Asks the summary server whether it has the model, in the background.
+    fn check_llm(&mut self) {
+        if self.demo {
+            return;
+        }
+        self.llm_state = None;
+        let (url, model) = (self.config.llm_url.clone(), self.config.llm_model.clone());
+        let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(LlmMsg::State(ollama::check(&url, &model)));
+            wake();
+        });
     }
 
     fn index_of(&self, file: &Path) -> Option<usize> {
@@ -324,6 +425,12 @@ impl Ui {
 
     fn new_meeting(&mut self) {
         if !matches!(self.rec, Rec::Idle) {
+            return;
+        }
+        if !self.speech_ready() {
+            self.selected = None;
+            self.download_speech();
+            self.status = Some(("Downloading the speech model first. It only happens once.".into(), false));
             return;
         }
         let meeting = Meeting::new(&self.config.notes_dir);
@@ -401,7 +508,7 @@ impl Ui {
         }
         let m = &self.meetings[i];
         let (file, notes, lines) = (m.file.clone(), self.notes.text.clone(), m.lines.clone());
-        let llm = Llm { url: self.config.llm_url.clone(), model: self.config.llm_model.clone() };
+        let llm = Llm::from_config(&self.config);
         let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
         self.meetings[i].summary.clear();
         self.summarizing = Some(file.clone());
@@ -431,24 +538,34 @@ impl Ui {
         self.save(i);
     }
 
+    /// Spanish ↔ English; the speech model follows the language (a custom model path stays).
     fn cycle_language(&mut self) {
-        let at = LANGUAGES.iter().position(|(c, _)| *c == self.config.language).unwrap_or(0);
-        self.config.language = LANGUAGES[(at + 1) % LANGUAGES.len()].0.to_string();
-        self.save_config();
-    }
-
-    fn cycle_model(&mut self) {
-        let mut models: Vec<PathBuf> = std::fs::read_dir(config::data_dir().join("models"))
-            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "gguf") && !p.ends_with(crate::vad::FILE)).collect())
-            .unwrap_or_default();
-        models.sort();
-        if models.len() < 2 {
-            self.status = Some((format!("Speech model: {}", tilde(&self.config.speech_model)), false));
+        if !matches!(self.rec, Rec::Idle) || self.download.as_ref().is_some_and(|d| d.what == Fetch::Speech) {
             return;
         }
-        let at = models.iter().position(|p| *p == self.config.speech_model).map_or(0, |i| i + 1);
-        self.config.speech_model = models[at % models.len()].clone();
+        let at = models::LANGUAGES.iter().position(|(c, _)| *c == self.config.language);
+        let code = models::LANGUAGES[at.map_or(0, |i| (i + 1) % models::LANGUAGES.len())].0;
+        self.config.language = code.to_string();
+        let custom = models::for_path(&self.config.speech_model).is_none() && self.config.speech_model.exists();
+        if !custom {
+            self.config.speech_model = models::for_language(code).path();
+        }
         self.save_config();
+        let a = self.speech_artifact();
+        self.status = Some((format!("{} · {}: {}", language_label(code), a.name, a.note), false));
+    }
+
+    /// Local → Claude → Codex → OpenCode, skipping the CLIs that aren't installed.
+    fn cycle_summaries(&mut self) {
+        let all = Summaries::ALL;
+        let at = all.iter().position(|p| *p == self.config.summaries).unwrap_or(0);
+        let next = (1..=all.len()).map(|k| all[(at + k) % all.len()]).find(|p| self.demo || p.installed()).unwrap_or(Summaries::Local);
+        self.config.summaries = next;
+        self.save_config();
+        if next == Summaries::Local {
+            self.check_llm();
+        }
+        self.status = Some((format!("Summaries · {}: {}", next.label(), next.note()), false));
     }
 
     fn save_config(&mut self) {
@@ -499,6 +616,28 @@ impl Ui {
                 }
             }
         }
+        while let Ok(msg) = self.dl.1.try_recv() {
+            changed = true;
+            match msg {
+                DlMsg::Progress(have, total) => {
+                    if let Some(d) = &mut self.download {
+                        (d.have, d.total) = (have, total);
+                    }
+                }
+                DlMsg::Done(what, result) => {
+                    self.download = None;
+                    match result {
+                        Ok(msg) => {
+                            self.status = Some((msg, false));
+                            if what == Fetch::Llm {
+                                self.llm_state = Some(ollama::State::Ready);
+                            }
+                        }
+                        Err(e) => self.warn(e),
+                    }
+                }
+            }
+        }
         while let Ok(msg) = self.llm.1.try_recv() {
             changed = true;
             match msg {
@@ -527,6 +666,7 @@ impl Ui {
                         }
                     }
                 }
+                LlmMsg::State(state) => self.llm_state = Some(state),
                 LlmMsg::Title(file, title) => {
                     if let Some(i) = self.index_of(&file) {
                         if self.meetings[i].title.starts_with("Meeting on") {
@@ -578,6 +718,7 @@ fn default_view(m: &Meeting) -> View {
 
 fn setup(s: &mut Ui, waker: Waker) {
     s.wake = waker;
+    s.check_llm();
 }
 
 fn poll(s: &mut Ui, t: f64, tx: &mut Tx) -> bool {
@@ -980,6 +1121,13 @@ fn composer(s: &Ui, m: &Meeting) -> El {
         Rec::Finishing { .. } if s.rec_file() == Some(m.file.as_path()) => {
             text("Finishing…").font(sans(13.5, 400.0)).color(P::secondary())
         }
+        Rec::Idle if !s.speech_ready() => match &s.download {
+            Some(d) if d.what == Fetch::Speech => download_progress(d, 150.0),
+            _ => {
+                let a = s.speech_artifact();
+                action_button("download-model", &format!("Download · {}", models::megabytes(a.bytes)), el(), |s: &mut Ui| s.download_speech())
+            }
+        },
         Rec::Idle => {
             let label = if m.lines.is_empty() { "Record" } else { "Resume" };
             action_button("record", label, dot(P::rec()).size(9.0, 9.0).radius(4.5), |s: &mut Ui| s.start_recording())
@@ -990,9 +1138,14 @@ fn composer(s: &Ui, m: &Meeting) -> El {
         .w_full()
         .gap(6.0)
         .center_y()
-        .child(chip_button("model", model_label(&s.config.speech_model), true, |s: &mut Ui| s.cycle_model()))
-        .child(chip_button("language", language_label(&s.config.language), true, |s: &mut Ui| s.cycle_language()))
-        .child(text("Local only").font(sans(14.0, 400.0)).color(P::secondary()).px(8.0).help("Audio, transcript and summary never leave this machine."))
+        .child(
+            chip_button("language", language_label(&s.config.language), true, |s: &mut Ui| s.cycle_language())
+                .help(format!("Transcribed on this machine with {}.", s.speech_artifact().name)),
+        )
+        .child(
+            chip_button("summaries", summaries_label(s), true, |s: &mut Ui| s.cycle_summaries())
+                .help(s.config.summaries.note().to_string()),
+        )
         .child(el().grow(1.0))
         .child(action);
     col()
@@ -1098,18 +1251,19 @@ fn summary_view(s: &Ui, i: usize, m: &Meeting) -> El {
     let running = s.summarizing.as_deref() == Some(m.file.as_path());
     let mut c = col().w_full().gap(12.0).pt(6.0).pb(28.0);
     if m.summary.trim().is_empty() && !running {
+        let how = match s.config.summaries {
+            Summaries::Local => format!(
+                "Hushnote writes it with a local LLM ({} at {}) when the meeting ends. Nothing leaves this machine.",
+                s.config.llm_model, s.config.llm_url
+            ),
+            p => format!("Hushnote writes it with {} when the meeting ends. {}", p.label(), p.note()),
+        };
         c = c
             .child(text("No summary yet").font(sans(17.0, 600.0)).color(P::text()))
-            .child(
-                text(format!(
-                    "Hushnote writes it with a local LLM ({} at {}) when the meeting ends. Nothing leaves this machine.",
-                    s.config.llm_model, s.config.llm_url
-                ))
-                .font(sans(15.0, 400.0))
-                .color(P::secondary())
-                .wrap(),
-            );
-        if !m.lines.is_empty() || !m.notes.trim().is_empty() {
+            .child(text(how).font(sans(15.0, 400.0)).color(P::secondary()).wrap());
+        if s.summaries_need_setup() {
+            c = c.child(llm_row(s));
+        } else if !m.lines.is_empty() || !m.notes.trim().is_empty() {
             c = c.child(row().pt(6.0).child(action_button("summarize", "Write summary", el(), |s: &mut Ui| s.summarize())));
         }
         return column("summary", c, false);
@@ -1200,7 +1354,118 @@ fn home_view(s: &Ui) -> El {
                 .child(stat("open action items", open_tasks.to_string())),
         )
         .child(row().pt(10.0).child(action_button("home-new", "New meeting", dot(P::rec()).size(9.0, 9.0).radius(4.5), |s: &mut Ui| s.new_meeting())));
+    let c = if !s.speech_ready() || s.summaries_need_setup() || s.download.is_some() {
+        c.child(
+            col()
+                .key("setup")
+                .w_full()
+                .pt(18.0)
+                .gap(8.0)
+                .child(text("SET UP").font(mono(11.5)).color(P::dim()).pb(2.0))
+                .child(speech_row(s))
+                .child(llm_row(s)),
+        )
+    } else {
+        c
+    };
     column("home", c, false)
+}
+
+/// Bytes so far and a thin bar, for a download.
+fn download_progress(d: &Download, width: f32) -> El {
+    let frac = if d.total > 0 { (d.have as f32 / d.total as f32).clamp(0.0, 1.0) } else { 0.0 };
+    let label = if d.total > 0 {
+        format!("{} / {}", models::megabytes(d.have), models::megabytes(d.total))
+    } else {
+        "Starting…".to_string()
+    };
+    row()
+        .key("download")
+        .gap(12.0)
+        .center_y()
+        .child(
+            el().w(width)
+                .h(4.0)
+                .radius(2.0)
+                .fill(P::line())
+                .child(el().w(width * frac).h(4.0).radius(2.0).fill(P::accent())),
+        )
+        .child(text(label).font(mono(12.5)).color(P::secondary()))
+        .child(chip_button("cancel-download", "Cancel".into(), false, |s: &mut Ui| s.cancel_download()))
+}
+
+fn setup_row(key: &str, title: String, detail: String, right: El) -> El {
+    row()
+        .key(key.to_string())
+        .w_full()
+        .px(16.0)
+        .py(12.0)
+        .gap(16.0)
+        .center_y()
+        .radius(9.0)
+        .border(1.0, P::line())
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(3.0)
+                .child(text(title).font(sans(14.5, 500.0)).color(P::text()))
+                .child(text(detail).font(sans(13.0, 400.0)).color(P::secondary()).wrap()),
+        )
+        .child(right)
+}
+
+fn ready() -> El {
+    row().gap(7.0).center_y().child(dot(P::accent())).child(text("Ready").font(mono(12.5)).color(P::secondary()))
+}
+
+fn speech_row(s: &Ui) -> El {
+    let a = s.speech_artifact();
+    let right = match &s.download {
+        Some(d) if d.what == Fetch::Speech => download_progress(d, 140.0),
+        _ if s.speech_ready() => ready(),
+        _ => action_button("setup-speech", &format!("Download · {}", models::megabytes(a.bytes)), el(), |s: &mut Ui| s.download_speech()),
+    };
+    setup_row("setup-speech-row", format!("Transcription · {}", a.name), format!("{}. Runs on this machine.", a.note), right)
+}
+
+/// "Local", "Claude"… for the composer's summary picker.
+fn summaries_label(s: &Ui) -> String {
+    format!("Summary · {}", s.config.summaries.label())
+}
+
+fn llm_row(s: &Ui) -> El {
+    let switch = chip_button("setup-llm-switch", "Switch".into(), true, |s: &mut Ui| s.cycle_summaries());
+    let provider = s.config.summaries;
+    if provider != Summaries::Local {
+        let (detail, right) = if s.summaries_ready() {
+            (provider.note().to_string(), ready())
+        } else {
+            (provider.install_hint().to_string(), chip_button("setup-llm-check", "Check again".into(), false, |_: &mut Ui| {}))
+        };
+        return setup_row("setup-llm-row", format!("Summaries · {}", provider.label()), detail, row().gap(6.0).center_y().child(right).child(switch));
+    }
+    let model = s.config.llm_model.clone();
+    let size = if model == ollama::DEFAULT_MODEL { " · 2.5 GB" } else { "" };
+    let (detail, right) = match (&s.llm_state, &s.download) {
+        (_, Some(d)) if d.what == Fetch::Llm => ("Downloading through Ollama.".to_string(), download_progress(d, 140.0)),
+        (Some(ollama::State::Ready), _) => ("Writes the summary on this machine.".to_string(), ready()),
+        (Some(ollama::State::Missing), _) => (
+            "Writes the summary on this machine, through Ollama. Or switch to Claude, Codex or OpenCode.".to_string(),
+            action_button("setup-llm", &format!("Download{size}"), el(), |s: &mut Ui| s.download_llm()),
+        ),
+        (Some(ollama::State::NotRunning), _) => (
+            "Needs Ollama: sudo pacman -S ollama && sudo systemctl enable --now ollama. Or switch to Claude, Codex or OpenCode.".to_string(),
+            chip_button("setup-llm-check", "Check again".into(), false, |s: &mut Ui| s.check_llm()),
+        ),
+        (None, _) => ("Checking Ollama…".to_string(), el()),
+    };
+    setup_row("setup-llm-row", format!("Summaries · {}", ollama_name(&model)), detail, row().gap(6.0).center_y().child(right).child(switch))
+}
+
+/// `qwen3:4b-instruct-2507-q4_K_M` → `qwen3:4b-instruct-2507`, for display.
+fn ollama_name(model: &str) -> &str {
+    model.strip_suffix("-q4_K_M").unwrap_or(model)
 }
 
 fn meter(label: &str, bars: &[Live<Color>]) -> El {
@@ -1322,7 +1587,9 @@ fn demo_meetings() -> Vec<Meeting> {
 
 fn scene_demo(s: &mut Ui) {
     s.demo = true;
-    s.config = Config { language: "en".into(), ..Config::default() };
+    s.speech_ready_override = Some(true);
+    s.llm_state = Some(ollama::State::Ready);
+    s.config = Config { language: "en".into(), speech_model: models::PARAKEET_EN.path(), ..Config::default() };
     s.config.notes_dir = dirs::home_dir().unwrap_or_default().join("Documents").join("Hushnote");
     s.meetings = demo_meetings();
     s.selected = Some(0);
@@ -1355,9 +1622,20 @@ fn scene_home(s: &mut Ui) {
     s.selected = None;
 }
 
+/// First run: nothing downloaded yet, the speech model on its way.
+fn scene_setup(s: &mut Ui) {
+    scene_empty(s);
+    s.speech_ready_override = Some(false);
+    s.llm_state = Some(ollama::State::Missing);
+    s.download = Some(Download { what: Fetch::Speech, have: 312_000_000, total: models::PARAKEET_V3.bytes, cancel: Arc::new(AtomicBool::new(false)) });
+}
+
 fn scene_empty(s: &mut Ui) {
     s.demo = true;
     s.config = Config::default();
+    s.config.notes_dir = dirs::home_dir().unwrap_or_default().join("Documents").join("Hushnote");
+    s.speech_ready_override = Some(true);
+    s.llm_state = Some(ollama::State::Ready);
     s.meetings.clear();
     s.selected = None;
     s.status = None;
@@ -1377,6 +1655,7 @@ pub fn run(args: Vec<String>) {
             ("recording", scene_recording),
             ("home", scene_home),
             ("empty", scene_empty),
+            ("setup", scene_setup),
         ],
         ..AppSpec::new("Hushnote", (1280.0, 840.0), || Ui::new(None), view)
     };
