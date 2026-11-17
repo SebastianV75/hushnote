@@ -3,11 +3,17 @@
 </p>
 
 <p>
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0E6B73?style=flat-square">
-  <img alt="Runs locally" src="https://img.shields.io/badge/runs-100%25%20locally-14262B?style=flat-square">
-  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-41575D?style=flat-square">
-  <img alt="Status: early version" src="https://img.shields.io/badge/status-early%20version-C8401A?style=flat-square">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-4D8DFF?style=flat-square&labelColor=141415">
+  <img alt="Runs locally" src="https://img.shields.io/badge/runs-100%25%20locally-EDEDEE?style=flat-square&labelColor=141415">
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-8C8C92?style=flat-square&labelColor=141415">
+  <img alt="Status: early version" src="https://img.shields.io/badge/status-early%20version-F2564B?style=flat-square&labelColor=141415">
 </p>
+
+```
+█    █  █ █▀▀▀ █    █▀▀▄ █▀▀█  █   █▀▀█
+█▀▀█ █  █ ▀▀▀█ █▀▀█ █  █ █  █ ▀█▀▀ █▀▀▀
+▀  ▀ ▀▀▀▀ ▀▀▀▀ ▀  ▀ ▀  ▀ ▀▀▀▀  ▀▀▀ ▀▀▀▀
+```
 
 # Hit record. Talk. Get the notes.
 
