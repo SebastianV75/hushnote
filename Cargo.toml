@@ -37,3 +37,10 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 opt-level = 2
+
+# The binary people install (scripts/ci.sh builds it): small and fast. The speech engine (C++)
+# is always built optimized; ci.sh pins its CPU floor so it runs on any x86-64 laptop with AVX2.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
