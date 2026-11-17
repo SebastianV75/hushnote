@@ -1,7 +1,7 @@
-//! Corta una pista en frases para transcribirlas mientras la reunión sigue: abre un fragmento
-//! cuando hay voz, lo cierra tras una pausa (o al llegar al máximo) y guarda un poco de audio
-//! anterior para no comerse el inicio de la palabra. Detección por energía con un piso de
-//! ruido que se adapta.
+//! Cuts a track into phrases so they can be transcribed while the meeting goes on: opens a
+//! chunk when there is speech, closes it after a pause (or at the maximum length) and keeps a
+//! little audio from before so the start of the first word isn't lost. Energy-based detection
+//! with an adaptive noise floor.
 
 use crate::audio::RATE;
 
@@ -12,7 +12,7 @@ const MIN_SPEECH: usize = (RATE as usize) * 600 / 1000;
 const MAX_CHUNK: usize = (RATE as usize) * 20;
 const MIN_CUT: usize = (RATE as usize) * 2;
 
-/// Un fragmento con voz, listo para el modelo. `start` en muestras desde el inicio de la pista.
+/// A chunk with speech, ready for the model. `start` is in samples from the track's start.
 #[derive(Debug)]
 pub struct Chunk {
     pub start: usize,
@@ -21,7 +21,7 @@ pub struct Chunk {
 
 pub struct Segmenter {
     pending: Vec<f32>,
-    /// Muestras vistas antes de `pending`.
+    /// Samples seen before `pending`.
     pos: usize,
     floor: f32,
     preroll: Vec<f32>,
@@ -47,7 +47,7 @@ impl Default for Segmenter {
 }
 
 impl Segmenter {
-    /// Nivel de la última trama, 0..1, para el medidor.
+    /// Level of the last frame, 0..1, for the meter.
     pub fn level(&self) -> f32 {
         self.level
     }
@@ -68,7 +68,7 @@ impl Segmenter {
         out
     }
 
-    /// Cierra lo que quede al detener la grabación.
+    /// Closes whatever is left when recording stops.
     pub fn flush(&mut self) -> Option<Chunk> {
         let rest = std::mem::take(&mut self.pending);
         if let Some(current) = self.current.as_mut() {
@@ -84,7 +84,7 @@ impl Segmenter {
         self.level = ((20.0 * rms.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0);
         let speech = rms > (self.floor * 3.0).max(0.008);
         if !speech {
-            // El piso sigue al ruido de fondo: baja rápido, sube despacio.
+            // The floor follows background noise: it falls fast and rises slowly.
             self.floor = if rms < self.floor { self.floor * 0.9 + rms * 0.1 } else { self.floor * 0.995 + rms * 0.005 };
         }
 
@@ -114,7 +114,7 @@ impl Segmenter {
                 }
                 let len = current.pcm.len();
                 let paused = self.silence >= PAUSE;
-                // Al pasar del máximo corta en la próxima trama silenciosa, o a la fuerza a 1.5×.
+                // Past the maximum, cut at the next silent frame, or forcibly at 1.5×.
                 let long = len >= MAX_CHUNK && (!speech || len >= MAX_CHUNK * 3 / 2) && len >= MIN_CUT;
                 if paused || long { self.close() } else { None }
             }
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn dos_frases_separadas_por_una_pausa_son_dos_fragmentos() {
+    fn two_phrases_separated_by_a_pause_are_two_chunks() {
         let mut s = Segmenter::default();
         let mut audio = tone(1.0, 0.0);
         audio.extend(tone(2.0, 0.3));
@@ -152,13 +152,13 @@ mod tests {
         }
         chunks.extend(s.flush());
         assert_eq!(chunks.len(), 2, "{chunks:?}");
-        // El primero empieza ~300 ms antes de la voz (1 s).
+        // The first starts ~300 ms before the speech (at 1 s).
         let start = chunks[0].start as f32 / RATE as f32;
-        assert!((0.6..1.0).contains(&start), "inicio {start}");
+        assert!((0.6..1.0).contains(&start), "start {start}");
     }
 
     #[test]
-    fn el_silencio_y_los_golpes_cortos_no_se_transcriben() {
+    fn silence_and_short_knocks_are_not_transcribed() {
         let mut s = Segmenter::default();
         let mut audio = tone(2.0, 0.0);
         audio.extend(tone(0.2, 0.5));
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn un_monologo_largo_se_corta() {
+    fn a_long_monologue_is_cut() {
         let mut s = Segmenter::default();
         let chunks = s.push(&tone(50.0, 0.3));
         assert!(chunks.len() >= 1);

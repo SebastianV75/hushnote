@@ -1,26 +1,30 @@
-//! Resúmenes con un LLM local por la API compatible con OpenAI (`/v1/chat/completions`), que
-//! hablan Ollama, llama-server (llama.cpp) y LM Studio. Nada sale de la máquina.
+//! Summaries from a local LLM over the OpenAI-compatible API (`/v1/chat/completions`), which
+//! Ollama, llama-server (llama.cpp) and LM Studio all speak. Nothing leaves the machine.
 //!
-//! Ollama usa un contexto corto por defecto, así que una reunión larga se resume por partes y
-//! luego se unen los resúmenes parciales.
+//! Ollama uses a short context by default, so a long meeting is summarized in parts and the
+//! partial summaries are then merged.
 
 use crate::session::Line;
 use std::io::{BufRead, BufReader};
 
 const PART_CHARS: usize = 8_000;
 
-const SYSTEM: &str = "Eres un asistente que escribe notas de reuniones en español, claras y \
-concisas, en Markdown. Usa solo lo que está en la transcripción y en las notas del usuario; \
-no inventes datos. La transcripción es automática y puede tener errores de palabras: \
-interprétalos con sentido común. \"Tú\" es el usuario; \"Ellos\" son los demás participantes.";
+const SYSTEM: &str = "You are an assistant that writes clear, concise meeting notes in \
+Markdown. Always write in the same language the meeting was held in (the language of the \
+transcript), even though these instructions are in English. Use only what is in the transcript \
+and the user's notes; never invent facts. The transcript is automatic and may contain wrong \
+words: interpret them with common sense. \"You\" is the user; \"Them\" are the other \
+participants.";
 
-const FORMAT: &str = "Escribe las notas con exactamente estas secciones:\n\
-## Resumen\n(2 a 4 frases)\n\
-## Puntos clave\n(viñetas)\n\
-## Decisiones\n(viñetas; \"Ninguna\" si no hubo)\n\
-## Pendientes\n(lista de tareas `- [ ] tarea — responsable` si se sabe; \"Ninguno\" si no hubo)\n\
-Si el usuario tomó notas, respétalas: son lo que más le importa, complétalas con detalles de \
-la transcripción. No añadas nada antes ni después de las secciones.";
+const FORMAT: &str = "Write the notes with exactly these three sections, with the headings \
+translated into the meeting's language:\n\
+## Decisions\n(bullets; \"None\" if there were none)\n\
+## Action items\n(a task list, one line each: `- [ ] Owner does the task · due`. Add ` · due` only \
+when a day or date was said, as a short word such as Thu or Mar 9. \"None\" if there were none)\n\
+## Open questions\n(bullets; \"None\" if there were none)\n\
+Put names, dates, amounts and product names in `inline code` sparingly, only when it helps \
+scanning. If the user took notes, honour them: they are what matters most to the user, so \
+expand them with details from the transcript. Add nothing before or after the sections.";
 
 pub struct Llm {
     pub url: String,
@@ -28,7 +32,7 @@ pub struct Llm {
 }
 
 pub fn transcript_text(lines: &[Line]) -> String {
-    lines.iter().map(|l| format!("[{}] {}: {}\n", clock(l.t_ms), l.speaker.nombre(), l.text)).collect()
+    lines.iter().map(|l| format!("[{}] {}: {}\n", clock(l.t_ms), l.speaker.name(), l.text)).collect()
 }
 
 pub fn clock(ms: u64) -> String {
@@ -36,7 +40,7 @@ pub fn clock(ms: u64) -> String {
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{:02}:{:02}", s / 60, s % 60) }
 }
 
-/// Parte la transcripción en trozos de líneas completas.
+/// Splits the transcript into pieces of whole lines.
 fn parts(text: &str) -> Vec<String> {
     let mut out = vec![String::new()];
     for line in text.lines() {
@@ -51,7 +55,7 @@ fn parts(text: &str) -> Vec<String> {
     out
 }
 
-/// Quita bloques `<think>…</think>` que algunos modelos (Qwen3, DeepSeek-R1) escriben.
+/// Strips the `<think>…</think>` blocks some models (Qwen3, DeepSeek-R1) write.
 #[derive(Default)]
 struct ThinkFilter {
     buf: String,
@@ -79,7 +83,7 @@ impl ThinkFilter {
                         self.thinking = true;
                     }
                     None => {
-                        // Guarda un posible "<thi" partido al final.
+                        // Keep a possible "<thi" split at the end.
                         let keep = (1.."<think>".len()).rev()
                             .find(|&n| self.buf.ends_with(&"<think>"[..n])).unwrap_or(0);
                         let cut = self.buf.len() - keep;
@@ -107,7 +111,7 @@ impl Llm {
         });
         let response = ureq::post(&url).send_json(&body).map_err(|e| {
             format!(
-                "No pude hablar con el LLM local en {} ({e}). ¿Está corriendo Ollama? Prueba `ollama serve` y `ollama pull {}`.",
+                "Could not reach the local LLM at {} ({e}). Is Ollama running? Try `ollama serve` and `ollama pull {}`.",
                 self.url, self.model
             )
         })?;
@@ -115,7 +119,7 @@ impl Llm {
         let mut filter = ThinkFilter::default();
         let mut full = String::new();
         for line in reader.lines() {
-            let line = line.map_err(|e| format!("respuesta cortada: {e}"))?;
+            let line = line.map_err(|e| format!("response cut off: {e}"))?;
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
             if data == "[DONE]" {
@@ -133,37 +137,37 @@ impl Llm {
         Ok(full.trim().to_string())
     }
 
-    /// Escribe las notas finales; `on_delta` recibe el texto mientras llega.
+    /// Writes the final notes; `on_delta` receives the text as it arrives.
     pub fn summarize(&self, notes: &str, lines: &[Line], on_delta: impl FnMut(&str)) -> Result<String, String> {
         let transcript = transcript_text(lines);
         if transcript.trim().is_empty() && notes.trim().is_empty() {
-            return Err("No hay transcripción ni notas que resumir.".into());
+            return Err("There is no transcript and no notes to summarize.".into());
         }
         let pieces = parts(&transcript);
         let material = if pieces.len() <= 1 {
-            format!("Transcripción:\n{transcript}")
+            format!("Transcript:\n{transcript}")
         } else {
             let mut partial = String::new();
             for (i, piece) in pieces.iter().enumerate() {
                 let prompt = format!(
-                    "Esta es la parte {} de {} de una reunión. Extrae en viñetas los puntos clave, \
-                     decisiones y pendientes con sus responsables. Solo viñetas.\n\n{piece}",
+                    "This is part {} of {} of a meeting. Extract the key points, decisions and \
+                     action items (with owners) as bullets, in the meeting's language. Bullets only.\n\n{piece}",
                     i + 1,
                     pieces.len()
                 );
                 let summary = self.chat(SYSTEM, &prompt, |_| {})?;
-                partial.push_str(&format!("### Parte {}\n{summary}\n\n", i + 1));
+                partial.push_str(&format!("### Part {}\n{summary}\n\n", i + 1));
             }
-            format!("Notas parciales de la reunión, en orden:\n{partial}")
+            format!("Partial notes of the meeting, in order:\n{partial}")
         };
-        let notes = if notes.trim().is_empty() { "(el usuario no tomó notas)".to_string() } else { notes.to_string() };
-        let prompt = format!("Notas del usuario:\n{notes}\n\n{material}\n\n{FORMAT}");
+        let notes = if notes.trim().is_empty() { "(the user took no notes)".to_string() } else { notes.to_string() };
+        let prompt = format!("The user's notes:\n{notes}\n\n{material}\n\n{FORMAT}");
         self.chat(SYSTEM, &prompt, on_delta)
     }
 
-    /// Un título corto para la reunión.
+    /// A short title for the meeting.
     pub fn title(&self, summary: &str) -> Result<String, String> {
-        let prompt = format!("Escribe un título de 3 a 6 palabras para esta reunión, sin comillas ni punto final:\n\n{summary}");
+        let prompt = format!("Write a 3 to 6 word title for this meeting, in the meeting's language, without quotes or a final period:\n\n{summary}");
         let t = self.chat(SYSTEM, &prompt, |_| {})?;
         Ok(t.lines().next().unwrap_or("").trim_matches(['"', '#', ' ', '*']).to_string())
     }
@@ -174,17 +178,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filtra_el_razonamiento_aunque_llegue_partido() {
+    fn strips_reasoning_even_when_split() {
         let mut f = ThinkFilter::default();
         let mut out = String::new();
-        for piece in ["Hola <th", "ink>pienso", " mucho</thi", "nk> mundo"] {
+        for piece in ["Hello <th", "ink>thinking", " hard</thi", "nk> world"] {
             out.push_str(&f.push(piece));
         }
-        assert_eq!(out, "Hola  mundo");
+        assert_eq!(out, "Hello  world");
     }
 
     #[test]
-    fn parte_por_lineas_completas() {
+    fn splits_on_whole_lines() {
         let line = "x".repeat(100);
         let text: String = (0..200).map(|_| format!("{line}\n")).collect();
         let p = parts(&text);
@@ -194,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn reloj() {
+    fn clock_format() {
         assert_eq!(clock(65_000), "01:05");
         assert_eq!(clock(3_725_000), "1:02:05");
     }

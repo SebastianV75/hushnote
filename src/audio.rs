@@ -1,11 +1,12 @@
-//! Captura de audio a 16 kHz mono f32: micrófono ("Tú") y audio del sistema ("Ellos") como
-//! pistas separadas, con `pw-record` de PipeWire (o `parec` como respaldo). También lee
-//! archivos WAV, para importar grabaciones y para las pruebas.
+//! Audio capture at 16 kHz mono f32: the microphone ("You") and the system audio ("Them") as
+//! separate tracks, through PipeWire's `pw-record` (or `parec` as a fallback). Also reads WAV
+//! files, for importing recordings and for tests.
 //!
-//! La captura del sistema sigue la idea de Hex (`src/meeting/linux.rs`, MIT): `pw-record`
-//! con `stream.capture.sink=true` graba el monitor de la salida por defecto.
+//! System capture follows Hex (`src/meeting/linux.rs`, MIT): `pw-record` with
+//! `stream.capture.sink=true` records the monitor of the default output.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -16,36 +17,36 @@ pub const RATE: u32 = 16_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Speaker {
-    Yo,
-    Ellos,
-    /// Audio importado de un archivo: no sabemos quién habla.
+    Me,
+    Them,
+    /// Audio imported from a file: we don't know who is speaking.
     Audio,
 }
 
 impl Speaker {
-    pub fn nombre(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
-            Speaker::Yo => "Tú",
-            Speaker::Ellos => "Ellos",
+            Speaker::Me => "You",
+            Speaker::Them => "Them",
             Speaker::Audio => "Audio",
         }
     }
-    pub fn from_nombre(s: &str) -> Speaker {
+    pub fn from_name(s: &str) -> Speaker {
         match s {
-            "Tú" => Speaker::Yo,
-            "Ellos" => Speaker::Ellos,
+            "You" => Speaker::Me,
+            "Them" => Speaker::Them,
             _ => Speaker::Audio,
         }
     }
 }
 
-/// Un bloque de muestras de una pista.
+/// A block of samples from one track.
 pub struct Block {
     pub speaker: Speaker,
     pub pcm: Vec<f32>,
 }
 
-/// Un proceso de captura en marcha; al soltarlo se detiene.
+/// A running capture process; dropping it stops it.
 pub struct Capture {
     child: Child,
     stop: Arc<AtomicBool>,
@@ -58,6 +59,12 @@ impl Capture {
     }
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // The capture runs in its own process group: kill all of it, so a wrapper's children
+        // can't keep the pipe open and leave the reader (and the transcript) waiting forever.
+        if let Ok(pgid) = i32::try_from(self.child.id()) {
+            // SAFETY: kill(2) with a negative pid only sends a signal to that process group.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(t) = self.thread.take() {
@@ -77,8 +84,8 @@ fn has(cmd: &str) -> bool {
         .map(|s| s.success()).unwrap_or(false)
 }
 
-/// `pw-record` 1.3.81+ necesita `--raw` para escribir PCM sin cabecera a stdout; las versiones
-/// anteriores lo rechazan y ya escriben PCM crudo. Leemos su `--help` como hace Hex.
+/// `pw-record` 1.3.81+ needs `--raw` to write headerless PCM to stdout; older versions reject
+/// the flag and already write raw PCM. We read its `--help`, as Hex does.
 fn pw_record_takes_raw() -> bool {
     Command::new("pw-record").arg("--help").output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("--raw") || String::from_utf8_lossy(&o.stderr).contains("--raw"))
@@ -89,7 +96,7 @@ fn capture_command(speaker: Speaker) -> Result<Command, String> {
     if has("pw-record") {
         let mut c = Command::new("pw-record");
         c.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
-        if speaker == Speaker::Ellos {
+        if speaker == Speaker::Them {
             c.args(["-P", "{ stream.capture.sink=true }"]);
         }
         if pw_record_takes_raw() {
@@ -101,27 +108,28 @@ fn capture_command(speaker: Speaker) -> Result<Command, String> {
     if has("parec") {
         let mut c = Command::new("parec");
         c.args(["--raw", "--format=s16le", "--rate=16000", "--channels=1"]);
-        if speaker == Speaker::Ellos {
+        if speaker == Speaker::Them {
             c.arg("--device=@DEFAULT_MONITOR@");
         }
         return Ok(c);
     }
-    Err("No encontré `pw-record` (PipeWire) ni `parec` para grabar audio. En Arch/Omarchy: `sudo pacman -S pipewire`.".into())
+    Err("Found neither `pw-record` (PipeWire) nor `parec` to record audio. On Arch/Omarchy: `sudo pacman -S pipewire`.".into())
 }
 
-/// Empieza a capturar una pista; los bloques (~100 ms) llegan por `tx`.
+/// Starts capturing one track; blocks (~100 ms) arrive on `tx`.
 pub fn start(speaker: Speaker, tx: Sender<Block>) -> Result<Capture, String> {
     let mut child = capture_command(speaker)?
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("no pude iniciar la captura de {}: {e}", speaker.nombre()))?;
-    let mut out = child.stdout.take().ok_or("sin stdout")?;
+        .map_err(|e| format!("could not start capturing {}: {e}", speaker.name()))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let thread = std::thread::spawn(move || {
         let mut reader = PcmReader::default();
-        let mut buf = vec![0u8; 3200]; // 100 ms de s16 mono a 16 kHz
+        let mut buf = vec![0u8; 3200]; // 100 ms of s16 mono at 16 kHz
         while !flag.load(Ordering::Relaxed) {
             match out.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -137,7 +145,7 @@ pub fn start(speaker: Speaker, tx: Sender<Block>) -> Result<Capture, String> {
     Ok(Capture { child, stop, thread: Some(thread) })
 }
 
-/// Convierte bytes s16le en f32, saltando una cabecera WAV si el programa la escribe.
+/// Turns s16le bytes into f32, skipping a WAV header if the program writes one.
 #[derive(Default)]
 pub struct PcmReader {
     header: Vec<u8>,
@@ -155,7 +163,7 @@ impl PcmReader {
             self.header_done = true;
             let data = std::mem::take(&mut self.header);
             let start = if data.starts_with(b"RIFF") {
-                // Busca el bloque "data" y salta su cabecera de 8 bytes.
+                // Find the "data" chunk and skip its 8-byte header.
                 data.windows(4).position(|w| w == b"data").map(|p| p + 8).unwrap_or(44)
             } else {
                 0
@@ -182,7 +190,7 @@ impl PcmReader {
     }
 }
 
-/// Lee un WAV (cualquier tasa, mono o estéreo) como 16 kHz mono f32.
+/// Reads a WAV (any rate, mono or stereo) as 16 kHz mono f32.
 pub fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let spec = reader.spec();
@@ -198,7 +206,7 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     Ok(resample(&mono, spec.sample_rate, RATE))
 }
 
-/// Remuestreo lineal: suficiente para voz.
+/// Linear resampling: good enough for speech.
 pub fn resample(pcm: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || pcm.is_empty() {
         return pcm.to_vec();
@@ -222,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn salta_la_cabecera_wav_y_une_bytes_partidos() {
+    fn skips_the_wav_header_and_joins_split_bytes() {
         let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
         wav.extend_from_slice(&[0u8; 20]);
         wav.extend_from_slice(b"data\0\0\0\0");
@@ -235,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn pcm_crudo_sin_cabecera() {
+    fn raw_pcm_without_header() {
         let bytes: Vec<u8> = (0..30).flat_map(|_| 8192i16.to_le_bytes()).collect();
         let out = PcmReader::default().push(&bytes);
         assert_eq!(out.len(), 30);
@@ -243,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn remuestrea_a_16k() {
+    fn resamples_to_16k() {
         let pcm = vec![0.0; 48_000];
         assert_eq!(resample(&pcm, 48_000, 16_000).len(), 16_000);
     }

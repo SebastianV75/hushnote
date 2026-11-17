@@ -1,9 +1,9 @@
-//! Hushnote: notas de reuniones con transcripción y resúmenes 100% locales.
+//! Hushnote: meeting notes with transcription and summaries that stay 100% on your machine.
 //!
-//! - `hushnote` abre la app (Rune). Acepta las banderas de Rune para verificarla sin pantalla:
-//!   `hushnote --snap ui.png --scene demo`, `--tree`, `--script`…
-//! - `hushnote transcribir <archivo.wav> [--resumir]` prueba el motor sin interfaz.
-//! - `hushnote --capsula --snap capsula.png` dibuja sola la cápsula que se ve mientras graba.
+//! - `hushnote` opens the app (Rune). It takes Rune's flags for checking the UI without a
+//!   display: `hushnote --snap ui.png --scene demo`, `--tree`, `--script`…
+//! - `hushnote transcribe <file.wav> [--summarize]` tries the engine without the UI.
+//! - `hushnote --capsule --snap capsule.png` draws the recording capsule on its own.
 
 mod audio;
 mod config;
@@ -20,26 +20,27 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 
-const AYUDA: &str = "Hushnote: notas de reuniones 100% locales.
+const HELP: &str = "Hushnote: meeting notes that stay on your machine.
 
-Uso:
-  hushnote                                 abre la app
-  hushnote transcribir <archivo.wav> [--resumir]
-                                          transcribe un WAV y, si se pide, lo resume con el LLM local
-  hushnote --ayuda                         esta ayuda
+Usage:
+  hushnote                                  open the app
+  hushnote transcribe <file.wav> [--summarize]
+                                            transcribe a WAV file and, if asked, summarize it
+                                            with the local LLM
+  hushnote --help                           show this help
 
-Configuración: ~/.config/hushnote/config.json";
+Settings: ~/.config/hushnote/config.json";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("transcribir") => transcribir(&args[1..]),
-        Some("--ayuda" | "-h" | "--help" | "ayuda") => {
-            println!("{AYUDA}");
+        Some("transcribe") => transcribe(&args[1..]),
+        Some("--help" | "-h" | "help") => {
+            println!("{HELP}");
             ExitCode::SUCCESS
         }
-        _ if args.iter().any(|a| a == "--capsula") => {
-            ui::run_capsule(args.into_iter().filter(|a| a != "--capsula").collect());
+        _ if args.iter().any(|a| a == "--capsule") => {
+            ui::run_capsule(args.into_iter().filter(|a| a != "--capsule").collect());
             ExitCode::SUCCESS
         }
         _ => {
@@ -49,17 +50,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn transcribir(args: &[String]) -> ExitCode {
-    let resumir = args.iter().any(|a| a == "--resumir");
+fn transcribe(args: &[String]) -> ExitCode {
+    let summarize = args.iter().any(|a| a == "--summarize");
     let Some(wav) = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from) else {
-        eprintln!("Falta el archivo. Uso: hushnote transcribir <archivo.wav> [--resumir]");
+        eprintln!("Missing the file. Usage: hushnote transcribe <file.wav> [--summarize]");
         return ExitCode::from(2);
     };
     let config = Config::load();
     let (tx, rx) = mpsc::channel();
-    eprintln!("Modelo: {}", config.modelo_voz.display());
+    eprintln!("Model: {}", config.speech_model.display());
     let started = std::time::Instant::now();
-    if let Err(e) = session::transcribe_file(&wav, config.modelo_voz.clone(), config.idioma(), tx, Arc::new(|| {})) {
+    if let Err(e) = session::transcribe_file(&wav, config.speech_model.clone(), config.language(), tx, Arc::new(|| {})) {
         eprintln!("hushnote: {e}");
         return ExitCode::FAILURE;
     }
@@ -79,12 +80,12 @@ fn transcribir(args: &[String]) -> ExitCode {
             Event::Finished => break,
         }
     }
-    eprintln!("Transcrito en {:.1} s.", started.elapsed().as_secs_f32());
+    eprintln!("Transcribed in {:.1} s.", started.elapsed().as_secs_f32());
     if failed && lines.is_empty() {
         return ExitCode::FAILURE;
     }
-    if resumir {
-        let llm = llm::Llm { url: config.llm_url.clone(), model: config.llm_modelo.clone() };
+    if summarize {
+        let llm = llm::Llm { url: config.llm_url.clone(), model: config.llm_model.clone() };
         println!();
         let result = llm.summarize("", &lines, |delta| {
             print!("{delta}");

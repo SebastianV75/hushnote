@@ -1,5 +1,5 @@
-//! Cada reunión es un archivo Markdown en la carpeta de notas: legible en cualquier editor
-//! (Obsidian, rune, nvim…). Unos comentarios HTML marcan las secciones para volver a leerlo.
+//! Each meeting is a Markdown file in the notes folder, readable in any editor (Obsidian,
+//! nvim…). HTML comments mark the sections so the file can be read back.
 
 use crate::audio::Speaker;
 use crate::llm::clock;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct Meeting {
     pub file: PathBuf,
     pub title: String,
-    /// "AAAA-MM-DD HH:MM"
+    /// "YYYY-MM-DD HH:MM"
     pub date: String,
     pub duration_ms: u64,
     pub notes: String,
@@ -18,16 +18,16 @@ pub struct Meeting {
     pub lines: Vec<Line>,
 }
 
-const NOTAS: &str = "<!-- hushnote:notas -->";
-const RESUMEN: &str = "<!-- hushnote:resumen -->";
-const TRANSCRIPCION: &str = "<!-- hushnote:transcripcion -->";
+const NOTES: &str = "<!-- hushnote:notes -->";
+const SUMMARY: &str = "<!-- hushnote:summary -->";
+const TRANSCRIPT: &str = "<!-- hushnote:transcript -->";
 
 impl Meeting {
     pub fn new(dir: &Path) -> Meeting {
         let now = chrono::Local::now();
         Meeting {
             file: dir.join(format!("{}.md", now.format("%Y-%m-%d_%H%M%S"))),
-            title: format!("Reunión del {}", now.format("%d/%m %H:%M")),
+            title: format!("Meeting on {}", now.format("%b %-d, %H:%M")),
             date: now.format("%Y-%m-%d %H:%M").to_string(),
             ..Default::default()
         }
@@ -35,17 +35,17 @@ impl Meeting {
 
     pub fn to_markdown(&self) -> String {
         let mut md = format!(
-            "---\ntitulo: \"{}\"\nfecha: {}\nduracion: {}\n---\n\n# {}\n\n",
+            "---\ntitle: \"{}\"\ndate: {}\nduration: {}\n---\n\n# {}\n\n",
             self.title.replace('"', "'"),
             self.date,
             clock(self.duration_ms),
             self.title
         );
-        md.push_str(&format!("{NOTAS}\n## Mis notas\n\n{}\n\n", self.notes.trim()));
-        md.push_str(&format!("{RESUMEN}\n{}\n\n", self.summary.trim()));
-        md.push_str(&format!("{TRANSCRIPCION}\n## Transcripción\n\n"));
+        md.push_str(&format!("{NOTES}\n## My notes\n\n{}\n\n", self.notes.trim()));
+        md.push_str(&format!("{SUMMARY}\n{}\n\n", self.summary.trim()));
+        md.push_str(&format!("{TRANSCRIPT}\n## Transcript\n\n"));
         for l in &self.lines {
-            md.push_str(&format!("- **[{}] {}:** {}\n", clock(l.t_ms), l.speaker.nombre(), l.text));
+            md.push_str(&format!("- **[{}] {}:** {}\n", clock(l.t_ms), l.speaker.name(), l.text));
         }
         md
     }
@@ -68,9 +68,9 @@ impl Meeting {
                     let Some((k, v)) = line.split_once(':') else { continue };
                     let v = v.trim().trim_matches('"').to_string();
                     match k.trim() {
-                        "titulo" => m.title = v,
-                        "fecha" => m.date = v,
-                        "duracion" => m.duration_ms = parse_clock(&v).unwrap_or(0),
+                        "title" => m.title = v,
+                        "date" => m.date = v,
+                        "duration" => m.duration_ms = parse_clock(&v).unwrap_or(0),
                         _ => {}
                     }
                 }
@@ -83,15 +83,15 @@ impl Meeting {
             let j = end.and_then(|e| rest.find(e)).unwrap_or(rest.len());
             rest[..j].trim().to_string()
         };
-        m.notes = section(NOTAS, Some(RESUMEN)).trim_start_matches("## Mis notas").trim().to_string();
-        m.summary = section(RESUMEN, Some(TRANSCRIPCION));
-        for line in section(TRANSCRIPCION, None).lines() {
-            // - **[01:05] Tú:** texto
+        m.notes = section(NOTES, Some(SUMMARY)).trim_start_matches("## My notes").trim().to_string();
+        m.summary = section(SUMMARY, Some(TRANSCRIPT));
+        for line in section(TRANSCRIPT, None).lines() {
+            // - **[01:05] You:** text
             let Some(rest) = line.strip_prefix("- **[") else { continue };
             let Some((time, rest)) = rest.split_once("] ") else { continue };
             let Some((who, text)) = rest.split_once(":** ") else { continue };
             m.lines.push(Line {
-                speaker: Speaker::from_nombre(who),
+                speaker: Speaker::from_name(who),
                 t_ms: parse_clock(time).unwrap_or(0),
                 text: text.to_string(),
             });
@@ -113,7 +113,7 @@ fn parse_clock(s: &str) -> Option<u64> {
     Some(secs * 1000)
 }
 
-/// Las reuniones guardadas, de la más nueva a la más vieja.
+/// The saved meetings, newest first.
 pub fn list(dir: &Path) -> Vec<Meeting> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut files: Vec<PathBuf> = entries
@@ -130,21 +130,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ida_y_vuelta_por_markdown() {
+    fn round_trips_through_markdown() {
         let m = Meeting {
             file: PathBuf::from("/tmp/x.md"),
-            title: "Planeación \"Q1\"".into(),
+            title: "Planning \"Q1\"".into(),
             date: "2026-11-17 16:30".into(),
             duration_ms: 125_000,
-            notes: "- revisar presupuesto\n- llamar a Ana".into(),
-            summary: "## Resumen\nSe habló del presupuesto.\n\n## Pendientes\n- [ ] Llamar a Ana".into(),
+            notes: "- review the budget\n- call Ana".into(),
+            summary: "## Summary\nWe talked about the budget.\n\n## Action items\n- [ ] Call Ana".into(),
             lines: vec![
-                Line { speaker: Speaker::Yo, t_ms: 5_000, text: "Hola, ¿empezamos?".into() },
-                Line { speaker: Speaker::Ellos, t_ms: 65_000, text: "Sí: primero el presupuesto.".into() },
+                Line { speaker: Speaker::Me, t_ms: 5_000, text: "Hi, shall we start?".into() },
+                Line { speaker: Speaker::Them, t_ms: 65_000, text: "Yes: the budget first.".into() },
             ],
         };
         let back = Meeting::parse(&m.file, &m.to_markdown());
-        assert_eq!(back.title, "Planeación 'Q1'");
+        assert_eq!(back.title, "Planning 'Q1'");
         assert_eq!(back.date, m.date);
         assert_eq!(back.duration_ms, m.duration_ms);
         assert_eq!(back.notes, m.notes);

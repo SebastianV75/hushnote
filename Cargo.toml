@@ -3,25 +3,26 @@ name = "hushnote"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Notas de reuniones con transcripción y resúmenes 100% locales, hecho con Rune"
+description = "Meeting notes with transcription and summaries that stay 100% on your machine, built with Rune"
 
 [features]
 default = []
-# Transcripción en GPU con Vulkan (como Hex). Sin ella corre en CPU.
+# Transcription on the GPU with Vulkan (as Hex does). Without it, it runs on the CPU.
 vulkan = ["transcribe-cpp/vulkan"]
 
 [dependencies]
-# Rune fijado a un commit de `dev` (su README: "Depending on Rune").
+# Rune pinned to a commit on `dev` (its README: "Depending on Rune").
 rune = { git = "https://github.com/anomalyco/rune", rev = "842c28c2ca5dd1506c1e4a67052db61800aed721" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "842c28c2ca5dd1506c1e4a67052db61800aed721", features = ["markdown"] }
-# El mismo motor de transcripción local que Hex.
-transcribe-cpp = "=0.4.1"
+# The same local speech engine as Hex (0.4.2: the bindings must match transcribe-cpp-sys).
+transcribe-cpp = "=0.4.2"
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 hound = "3.5"
+libc = "0.2"
 
 [patch.crates-io]
 winit = { git = "https://github.com/anomalyco/rune", rev = "842c28c2ca5dd1506c1e4a67052db61800aed721" }
