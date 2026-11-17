@@ -12,6 +12,7 @@ mod segmenter;
 mod session;
 mod store;
 mod ui;
+mod vad;
 
 use config::Config;
 use session::Event;

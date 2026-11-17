@@ -30,6 +30,13 @@ on the machine.** Main target: Linux on Omarchy (Hyprland, Wayland, PipeWire).
     - Parakeet Unified English (Hex's pick for English), rev `7e948f21…`, sha256 `4b50b6dd…`.
     - Whisper large-v3-turbo (Hex's pick for other languages), rev `d222c9f6…`,
       sha256 `d5e65f2b…`.
+    - Silero VAD v6.2 (1.2 MB, rev `a9b2d61c…`, sha256 `0d871a80…`), downloaded with every
+      model, as Hex does.
+- **Speech detection (`src/vad.rs`), as Hex's `speech_detector`:** the energy segmenter cuts
+  phrases; Silero then drops phrases without speech and trims the rest to it (threshold 0.4,
+  min speech 160 ms, 250 ms margin). Optional: without its file, everything is transcribed as
+  before. Measured: 30 s of fan noise, hum and clicks took 0.3 s instead of 1.9 s (the model
+  never runs), and speech after 6 s of noise is stamped 00:05 instead of 00:00.
   - Feature `vulkan` for the GPU; without it, it runs on the CPU.
 - **Why not use Hex directly:** Hex has Meetings with Linux code (pw-record per output, call
   detection with pw-dump), but `src/labs/catalog.rs:242` limits it to macOS, and on Linux its
@@ -65,16 +72,14 @@ Done and tested in the sandbox:
   phrases arrive live → Stop → transcript finishes → meeting saved with the notes; the automatic
   summary fails cleanly without an LLM. `cargo test e2e -- --ignored --nocapture` (needs the
   model, the fake `pw-record` on `PATH` and `XDG_CONFIG_HOME` pointing at scratch settings).
-- 12 unit tests (`cargo test`).
+- 14 unit tests (`cargo test`); ignored ones for the end-to-end run and the real Silero model.
 
 Not tested here (no PipeWire, GPU or disk for an LLM in the sandbox): real mic and system
 audio, the capsule as a Hyprland overlay, summaries with Ollama, `--features vulkan`.
 
 Next:
-1. Silero VAD v6.2 as Hex uses it (`handy-computer/silero-vad-v6.2-gguf`), instead of the
-   energy VAD, so silence and noise don't get transcribed (or hallucinated).
-2. Try it on Omarchy: audio, capsule, Ollama summary, Vulkan.
-3. Later: diarization (Sortformer in transcribe-cpp), importing audio from the UI, a Waybar
+1. Try it on Omarchy: audio, capsule, Ollama summary, Vulkan.
+2. Later: diarization (Sortformer in transcribe-cpp), importing audio from the UI, a Waybar
    icon and a global shortcut.
 
 ## Development environment (instabox sandbox)

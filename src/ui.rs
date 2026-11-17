@@ -439,7 +439,7 @@ impl Ui {
 
     fn cycle_model(&mut self) {
         let mut models: Vec<PathBuf> = std::fs::read_dir(config::data_dir().join("models"))
-            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "gguf")).collect())
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "gguf") && !p.ends_with(crate::vad::FILE)).collect())
             .unwrap_or_default();
         models.sort();
         if models.len() < 2 {

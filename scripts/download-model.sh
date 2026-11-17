@@ -5,6 +5,7 @@
 #   scripts/download-model.sh            Parakeet v3, 25 European languages incl. Spanish (default)
 #   scripts/download-model.sh english    Parakeet Unified English, Hex's pick for English
 #   scripts/download-model.sh whisper    Whisper large-v3-turbo, Hex's pick for other languages
+#   scripts/download-model.sh vad        only Silero VAD (1.2 MB; every model above also gets it)
 #
 # Then point `speech_model` in ~/.config/hushnote/config.json at the file (or pick it in the app).
 # The summaries use a local LLM you install separately, for example: ollama pull qwen3:8b
@@ -29,35 +30,43 @@ case "${1:-v3}" in
     FILE="whisper-large-v3-turbo-Q8_0.gguf"
     SHA256="d5e65f2b0828802ae2c231673d31982cebe3a778c95d9494a9f3efee6bd17448"
     SIZE="886 MB" ;;
+  vad)
+    REPO="" ;;
   -h | --help)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
   *)
-    echo "Unknown model '$1'. Use: v3, english or whisper." >&2
+    echo "Unknown model '$1'. Use: v3, english, whisper or vad." >&2
     exit 2 ;;
 esac
 
-URL="https://huggingface.co/${REPO}/resolve/${REV}/${FILE}"
 DIR="${XDG_DATA_HOME:-$HOME/.local/share}/hushnote/models"
-DEST="$DIR/$FILE"
+mkdir -p "$DIR"
 
-check() {
-  echo "${SHA256}  $1" | sha256sum --check --status
+# fetch REPO REV FILE SHA256 SIZE
+fetch() {
+  local repo=$1 rev=$2 file=$3 sha=$4 size=$5
+  local dest="$DIR/$file"
+  if [[ -f "$dest" ]] && echo "$sha  $dest" | sha256sum --check --status; then
+    echo "Already downloaded: $dest"
+    return
+  fi
+  echo "Downloading $file (~$size) to $DIR"
+  # Resumes a partial download if there is one.
+  curl --fail --location --continue-at - --progress-bar --output "$dest.part" \
+    "https://huggingface.co/$repo/resolve/$rev/$file"
+  if ! echo "$sha  $dest.part" | sha256sum --check --status; then
+    echo "The checksum of $file does not match. Delete $dest.part and run this again." >&2
+    exit 1
+  fi
+  mv "$dest.part" "$dest"
+  echo "Done: $dest"
 }
 
-mkdir -p "$DIR"
-if [[ -f "$DEST" ]] && check "$DEST"; then
-  echo "Already downloaded: $DEST"
-  exit 0
+if [[ -n "$REPO" ]]; then
+  fetch "$REPO" "$REV" "$FILE" "$SHA256" "$SIZE"
 fi
-
-echo "Downloading $FILE (~$SIZE) to $DIR"
-# Resumes a partial download if there is one.
-curl --fail --location --continue-at - --progress-bar --output "$DEST.part" "$URL"
-
-if ! check "$DEST.part"; then
-  echo "The checksum does not match. Delete $DEST.part and run this again." >&2
-  exit 1
-fi
-mv "$DEST.part" "$DEST"
-echo "Done: $DEST"
+# Silero VAD v6.2, which Hex downloads with every model: phrases without speech are skipped
+# instead of transcribed (models invent text for silence).
+fetch handy-computer/silero-vad-v6.2-gguf a9b2d61c20ae4ddf3644edb34969e8185a485448 \
+  silero-vad-v6.2-F32.gguf 0d871a800c420fdd5d1b17a3aea4296d1c39608f0ff4a9295eb76457eb1c88e6 "1.2 MB"

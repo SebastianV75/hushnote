@@ -74,7 +74,17 @@ fn spawn_transcriber(model_path: PathBuf, language: Option<String>, events: Send
             }
         };
         let options = RunOptions { language, ..Default::default() };
-        for job in rx {
+        let mut detector = crate::vad::Detector::load();
+        for mut job in rx {
+            // Silero drops phrases without speech and trims the rest (see vad.rs).
+            match detector.as_mut().and_then(|d| d.check(&job.pcm)) {
+                Some(crate::vad::Verdict::Silence) => continue,
+                Some(crate::vad::Verdict::Speech(r)) if r != (0..job.pcm.len()) => {
+                    job.t_ms += r.start as u64 * 1000 / RATE as u64;
+                    job.pcm = job.pcm[r].to_vec();
+                }
+                _ => {}
+            }
             match session.run(&job.pcm, &options) {
                 Ok(t) => {
                     let text = t.text.trim().to_string();
