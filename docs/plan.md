@@ -77,6 +77,9 @@ on the machine.** Main target: Linux on Omarchy (Hyprland, Wayland, PipeWire).
 - **Storage:** one Markdown file per meeting in `~/Documents/Hushnote` (or `~/Hushnote`), with
   sections marked `<!-- hushnote:notes -->`, `<!-- hushnote:summary -->` and
   `<!-- hushnote:transcript -->` so it can be read back.
+- **Release and install:** `scripts/ci.sh` (on this machine, as CI) runs the tests and builds a
+  portable release tarball (speech engine pinned to AVX2, never AVX-512); `scripts/install.sh`
+  installs it, and `--uninstall [--purge]` removes it. See `docs/install.md`.
 - **Settings:** `~/.config/hushnote/config.json` (created on first run; the app saves the model
   and language picked in the composer).
 

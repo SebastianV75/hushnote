@@ -4,7 +4,8 @@
 #
 # From the release tarball:   ./install.sh
 # From the repository:        scripts/install.sh   (builds it first if needed)
-# Remove:                     ./install.sh --uninstall
+# Remove the app:             ./install.sh --uninstall
+# Remove everything:          ./install.sh --uninstall --purge   (see docs/install.md)
 #
 # The speech model downloads from the app in one click (Home › Set up).
 set -euo pipefail
@@ -14,9 +15,51 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}"
 desktop="$data/applications/hushnote.desktop"
 icon="$data/icons/hicolor/256x256/apps/hushnote.png"
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hushnote"
+app_data="$data/hushnote"
+
+if [[ " $* " == *" --uninstall "* ]]; then
+    # The meetings folder, from the settings (it may have been moved).
+    notes=""
+    if [[ -f "$config_dir/config.json" ]]; then
+        notes=$(sed -n 's/^ *"notes_dir": *"\(.*\)",\{0,1\}$/\1/p' "$config_dir/config.json" | head -1)
+    fi
+    if [[ -z "$notes" ]]; then
+        docs=$(command -v xdg-user-dir >/dev/null && xdg-user-dir DOCUMENTS || echo "$HOME/Documents")
+        notes="$docs/Hushnote"
+    fi
+
     rm -f "$bin_dir/hushnote" "$desktop" "$icon"
-    echo "Removed Hushnote. Your meetings and models stay in ~/Documents/Hushnote and $data/hushnote."
+    command -v update-desktop-database >/dev/null && update-desktop-database "$data/applications" >/dev/null 2>&1 || true
+    echo "Removed the app."
+
+    if [[ " $* " != *" --purge "* ]]; then
+        echo "Kept your meetings ($notes), the speech models ($app_data) and settings ($config_dir)."
+        echo "Run with --uninstall --purge to remove those too."
+        exit 0
+    fi
+
+    rm -rf "$app_data" "$config_dir"
+    echo "Removed the speech models and settings."
+
+    if [[ -d "$notes" ]]; then
+        count=$(find "$notes" -maxdepth 1 -name '*.md' | wc -l)
+        read -r -p "Delete your $count meeting(s) in $notes? This can't be undone. [y/N] " answer
+        if [[ "$answer" =~ ^[yY] ]]; then
+            rm -rf "$notes"
+            echo "Deleted the meetings."
+        else
+            echo "Kept the meetings in $notes."
+        fi
+    fi
+
+    if command -v ollama >/dev/null && ollama list 2>/dev/null | grep -q '^qwen3:4b-instruct-2507'; then
+        read -r -p "Remove the summary model from Ollama (qwen3:4b-instruct-2507, 2.5 GB)? [y/N] " answer
+        if [[ "$answer" =~ ^[yY] ]]; then
+            ollama rm qwen3:4b-instruct-2507-q4_K_M >/dev/null && echo "Removed the summary model."
+        fi
+    fi
+    echo "Done. Ollama itself, if you installed it for Hushnote, is removed with: sudo pacman -Rns ollama"
     exit 0
 fi
 
