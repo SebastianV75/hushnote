@@ -266,6 +266,40 @@ mod tests {
         assert_eq!(capitalize("sí, claro."), "Sí, claro.");
         assert_eq!(capitalize(""), "");
     }
+
+    /// Real Spanish speech through the speech model: the whole recording, and its last seconds as
+    /// a short phrase after the rest as context. Neither may come out with letters Spanish
+    /// doesn't use, and the words in `HUSHNOTE_TEST_WORDS` (comma separated, optional) must be
+    /// in the whole transcript. The audio isn't in the repo (it's someone's voice):
+    /// `HUSHNOTE_TEST_AUDIO=/path/clip.wav HUSHNOTE_TEST_WORDS=tarea,exámenes \
+    ///  cargo test --release real_speech -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the speech model and HUSHNOTE_TEST_AUDIO"]
+    fn real_speech_comes_out_in_spanish() {
+        let path = std::env::var("HUSHNOTE_TEST_AUDIO").expect("set HUSHNOTE_TEST_AUDIO to a WAV with Spanish speech");
+        let pcm = audio::read_wav(Path::new(&path)).unwrap();
+        let model = crate::models::for_language("es").path();
+        let mut session = load_model(&model).unwrap().session().unwrap();
+        let options = RunOptions { language: Some("es".into()), timestamps: TimestampKind::Word, ..Default::default() };
+
+        let whole = transcribe_phrase(&mut session, &options, &[], &pcm).unwrap();
+        eprintln!("whole:        {whole}");
+        assert!(!whole.is_empty(), "nothing was transcribed");
+        assert_eq!(foreign_letters(&whole, "es"), 0, "letters Spanish doesn't use: {whole}");
+        let lower = whole.to_lowercase();
+        for word in std::env::var("HUSHNOTE_TEST_WORDS").unwrap_or_default().split(',').map(str::trim).filter(|w| !w.is_empty()) {
+            assert!(lower.contains(&word.to_lowercase()), "missing \"{word}\" in: {whole}");
+        }
+
+        let cut = pcm.len().saturating_sub(RATE as usize * 4);
+        let (before, phrase) = pcm.split_at(cut);
+        let alone = transcribe_phrase(&mut session, &options, &[], phrase).unwrap();
+        let with = transcribe_phrase(&mut session, &options, before, phrase).unwrap();
+        eprintln!("last 4 s alone:        {alone}");
+        eprintln!("last 4 s with context: {with}");
+        assert!(!with.is_empty(), "the phrase got lost with its context");
+        assert_eq!(foreign_letters(&with, "es"), 0, "letters Spanish doesn't use: {with}");
+    }
 }
 
 /// Transcribes a WAV file through the same pipeline (for importing audio).
