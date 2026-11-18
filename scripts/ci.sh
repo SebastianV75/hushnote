@@ -22,12 +22,13 @@ echo "== checks"
 # paths they only take after checking the CPU at runtime; those are fine.)
 engine=$(ls -td target/release/build/transcribe-cpp-sys-*/out/lib | head -1)
 for lib in "$engine"/libggml*.a "$engine"/libtranscribe.a; do
-    if objdump -d --no-show-raw-insn "$lib" | grep -q '%zmm'; then
+    # (no `grep -q`: it closes the pipe early and pipefail then reports objdump's SIGPIPE)
+    if [[ $(objdump -d --no-show-raw-insn "$lib" | grep -c '%zmm') -gt 0 ]]; then
         echo "$lib uses AVX-512; it would crash on most laptops" >&2
         exit 1
     fi
 done
-if ! objdump -d --no-show-raw-insn "$engine/libggml-cpu.a" | grep -q '%ymm'; then
+if [[ $(objdump -d --no-show-raw-insn "$engine/libggml-cpu.a" | grep -c '%ymm') -eq 0 ]]; then
     echo "the speech engine has no AVX2 code; it would be slow" >&2
     exit 1
 fi

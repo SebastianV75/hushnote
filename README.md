@@ -102,19 +102,32 @@ fine on the processor when there is not.
 Hushnote is an **early version** for **Linux**, with [Omarchy](https://omarchy.org) as
 the main target. Expect rough edges and quick progress.
 
+**Install (no compiling):** download the tarball from the
+[latest release](https://github.com/SebastianV75/hushnote/releases/latest), then:
+
+```bash
+tar xzf hushnote-*-linux-x86_64.tar.gz
+cd hushnote-*-linux-x86_64
+./install.sh
+```
+
+It puts `hushnote` in `~/.local/bin` and adds it to your app launcher. The speech model
+downloads from the app in one click (Home › Set up). To remove it: `./install.sh --uninstall`
+(add `--purge` to also delete models and settings).
+
+**From source** (needs Rust):
+
 ```bash
 git clone https://github.com/SebastianV75/hushnote
 cd hushnote
-cargo build --release
+scripts/install.sh
 ```
-
-A one-click installer is planned.
 
 <br>
 
 ## Roadmap
 
-- [ ] One-click installer
+- [x] One-click installer
 - [ ] Tell speakers apart by name
 - [ ] Search across all your past meetings
 - [ ] Tray icon and a global shortcut to start recording
