@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use transcribe_cpp::{Model, RunOptions};
+use transcribe_cpp::{Model, RunOptions, Session, TimestampKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Line {
@@ -49,10 +49,85 @@ pub fn load_model(path: &Path) -> Result<Arc<Model>, String> {
     Ok(model)
 }
 
+/// Reads the model file once in the background so the kernel keeps it in the page cache and
+/// the first meeting doesn't wait on the disk. It costs no memory of the app's own: the cache is
+/// reclaimed if anything else needs the RAM. (`posix_fadvise(WILLNEED)` would be the polite way,
+/// but some kernels read only the first few MB.)
+pub fn prewarm(path: &Path) {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return };
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 1 << 20];
+        while matches!(file.read(&mut buf), Ok(n) if n > 0) {}
+    });
+}
+
 struct Job {
     speaker: Speaker,
     t_ms: u64,
     pcm: Vec<f32>,
+}
+
+/// Speech from the same person that goes before each phrase. Parakeet v3 picks the language by
+/// itself and can't be told which one; on a short phrase alone it sometimes guesses wrong ("Sì,
+/// claro") or mishears a word ("lo vemos Mayara"). With a few seconds of what that person said
+/// before, it hears that the conversation is in Spanish and gets both right.
+const CONTEXT: usize = RATE as usize * 5;
+/// The context for a second try when the first one still came out in another alphabet.
+const LONG_CONTEXT: usize = RATE as usize * 15;
+/// Silence between the context and the phrase, so the two don't run into one word.
+const GAP: usize = RATE as usize * 3 / 10;
+
+/// Transcribes `pcm` after the tail of `before`, keeping only the phrase's own words.
+fn transcribe_phrase(session: &mut Session, options: &RunOptions, before: &[f32], pcm: &[f32]) -> Result<String, String> {
+    let language = options.language.as_deref().unwrap_or("es");
+    let mut best: Option<String> = None;
+    for context in [CONTEXT, LONG_CONTEXT] {
+        let context = &before[before.len().saturating_sub(context)..];
+        let mut text = with_context(session, options, context, pcm)?;
+        if text.is_empty() && !context.is_empty() {
+            // The phrase got absorbed into the context: try it on its own.
+            text = with_context(session, options, &[], pcm)?;
+        }
+        let worse = |b: &String| foreign_letters(&text, language) >= foreign_letters(b, language);
+        if !best.as_ref().is_some_and(worse) {
+            best = Some(text);
+        }
+        if best.as_ref().is_some_and(|b| foreign_letters(b, language) == 0) || context.len() == before.len() {
+            break;
+        }
+    }
+    Ok(best.unwrap_or_default())
+}
+
+fn with_context(session: &mut Session, options: &RunOptions, context: &[f32], pcm: &[f32]) -> Result<String, String> {
+    if context.is_empty() {
+        return session.run(pcm, options).map(|t| t.text.trim().to_string()).map_err(|e| e.to_string());
+    }
+    let mut audio = Vec::with_capacity(context.len() + GAP + pcm.len());
+    audio.extend_from_slice(context);
+    audio.resize(context.len() + GAP, 0.0);
+    audio.extend_from_slice(pcm);
+    let start_ms = ((context.len() + GAP) * 1000 / RATE as usize) as i64;
+    let t = session.run(&audio, options).map_err(|e| e.to_string())?;
+    // A word belongs to the phrase if most of it is after the gap.
+    let words: Vec<&str> = t.words.iter().filter(|w| (w.t0_ms + w.t1_ms) / 2 >= start_ms).map(|w| w.text.trim()).collect();
+    Ok(capitalize(&words.join(" ")))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// Letters that Spanish or English text doesn't use: a phrase in the wrong language ("Sì",
+/// Cyrillic, Japanese…).
+fn foreign_letters(text: &str, language: &str) -> usize {
+    let ours = |c: char| c.is_ascii() || (language == "es" && "áéíóúüñÁÉÍÓÚÜÑ".contains(c));
+    text.chars().filter(|c| c.is_alphabetic() && !ours(*c)).count()
 }
 
 /// Thread that transcribes chunks in order; sends `Finished` when its channel closes.
@@ -73,8 +148,10 @@ fn spawn_transcriber(model_path: PathBuf, language: Option<String>, events: Send
                 return;
             }
         };
-        let options = RunOptions { language, ..Default::default() };
+        // Word times tell which words belong to the phrase and which to the context before it.
+        let options = RunOptions { language: language.clone(), timestamps: TimestampKind::Word, ..Default::default() };
         let mut detector = crate::vad::Detector::load();
+        let mut heard: HashMap<Speaker, Vec<f32>> = HashMap::new();
         for mut job in rx {
             // Silero drops phrases without speech and trims the rest (see vad.rs).
             match detector.as_mut().and_then(|d| d.check(&job.pcm)) {
@@ -85,15 +162,18 @@ fn spawn_transcriber(model_path: PathBuf, language: Option<String>, events: Send
                 }
                 _ => {}
             }
-            match session.run(&job.pcm, &options) {
-                Ok(t) => {
-                    let text = t.text.trim().to_string();
+            let before = heard.entry(job.speaker).or_default();
+            match transcribe_phrase(&mut session, &options, before, &job.pcm) {
+                Ok(text) => {
                     if !text.is_empty() {
                         send(Event::Line(Line { speaker: job.speaker, t_ms: job.t_ms, text }));
                     }
                 }
                 Err(e) => send(Event::Error(format!("transcription: {e}"))),
             }
+            before.extend_from_slice(&job.pcm);
+            let excess = before.len().saturating_sub(LONG_CONTEXT);
+            before.drain(..excess);
         }
         send(Event::Finished);
     });
@@ -165,6 +245,26 @@ impl Recording {
             c.stop();
         }
         self.blocks.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spots_other_alphabets() {
+        assert_eq!(foreign_letters("Sí, claro, mañana a las tres. ¿Vale?", "es"), 0);
+        assert_eq!(foreign_letters("Sì, claro.", "es"), 1);
+        assert_eq!(foreign_letters("ありがとう", "es"), 5);
+        assert_eq!(foreign_letters("Привет", "en"), 6);
+        assert_eq!(foreign_letters("Mañana", "en"), 1);
+    }
+
+    #[test]
+    fn capitalizes_the_first_letter() {
+        assert_eq!(capitalize("sí, claro."), "Sí, claro.");
+        assert_eq!(capitalize(""), "");
     }
 }
 

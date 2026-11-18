@@ -2,8 +2,8 @@
 //! Search meetings, New meeting, then the meetings), and a bordered main panel with the live
 //! transcript as a chat in a 720 point column, a composer for "My notes", and a footer with the
 //! notes folder and the You/Them level meters. After the meeting the summary reads like an
-//! assistant's answer: Decisions, Action items (checkboxes, due day on the right) and Open
-//! questions.
+//! assistant's answer: Key points, Decisions, Action items (checkboxes, due day on the right)
+//! and Open questions, with the headings in the meeting's language.
 //!
 //! While recording, a capsule overlay at the top centre of the screen shows a red dot, the time
 //! and the last phrase (on Wayland it is a layer-shell surface and takes no clicks).
@@ -141,7 +141,8 @@ enum Rec {
 
 enum LlmMsg {
     Delta(PathBuf, String),
-    Done(PathBuf, Result<String, String>),
+    /// The summary, and who wrote it ("Qwen3 4B", "Claude"…).
+    Done(PathBuf, Result<String, String>, String),
     Title(PathBuf, String),
     State(ollama::State),
 }
@@ -254,6 +255,7 @@ impl Ui {
         if let Some(m) = ui.current() {
             ui.view = default_view(m);
         }
+        crate::session::prewarm(&ui.config.speech_model);
         ui
     }
 
@@ -509,6 +511,7 @@ impl Ui {
         let m = &self.meetings[i];
         let (file, notes, lines) = (m.file.clone(), self.notes.text.clone(), m.lines.clone());
         let llm = Llm::from_config(&self.config);
+        let by = llm.by();
         let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
         self.meetings[i].summary.clear();
         self.summarizing = Some(file.clone());
@@ -520,11 +523,20 @@ impl Ui {
             };
             let result = llm.summarize(&notes, &lines, |delta| send(LlmMsg::Delta(file.clone(), delta.to_string())));
             let title = result.as_ref().ok().and_then(|s| llm.title(s).ok()).filter(|t| !t.is_empty());
-            send(LlmMsg::Done(file.clone(), result));
+            send(LlmMsg::Done(file.clone(), result, by));
             if let Some(t) = title {
                 send(LlmMsg::Title(file, t));
             }
         });
+    }
+
+    /// Opens a meeting's Markdown file in the user's default editor.
+    fn open_file(&mut self, file: &std::path::Path) {
+        match std::process::Command::new("xdg-open").arg(file).spawn() {
+            // Reap it so it doesn't linger as a zombie.
+            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+            Err(e) => self.warn(format!("Couldn't open {}: {e}", file.display())),
+        }
     }
 
     /// Ticks or unticks the `line`th line of a meeting's summary (a `- [ ]` task).
@@ -550,6 +562,7 @@ impl Ui {
         if !custom {
             self.config.speech_model = models::for_language(code).path();
         }
+        crate::session::prewarm(&self.config.speech_model);
         self.save_config();
         let a = self.speech_artifact();
         self.status = Some((format!("{} · {}: {}", language_label(code), a.name, a.note), false));
@@ -646,7 +659,7 @@ impl Ui {
                         self.meetings[i].summary.push_str(&delta);
                     }
                 }
-                LlmMsg::Done(file, result) => {
+                LlmMsg::Done(file, result, by) => {
                     self.summarizing = None;
                     let i = self.index_of(&file);
                     match result {
@@ -654,6 +667,7 @@ impl Ui {
                             self.warned.remove(&file);
                             if let Some(i) = i {
                                 self.meetings[i].summary = summary;
+                                self.meetings[i].summary_by = by;
                                 self.save(i);
                                 if self.selected != Some(i) {
                                     self.unseen.insert(file);
@@ -1278,30 +1292,25 @@ fn summary_view(s: &Ui, i: usize, m: &Meeting) -> El {
     if running {
         c = c.child(row().gap(8.0).center_y().child(dot(P::accent())).child(text("Writing the summary…").font(sans(13.5, 400.0)).color(P::secondary())));
     } else {
-        c = c.child(saved_file(m)).child(row().child(action_button("resummarize", "Rewrite summary", el(), |s: &mut Ui| s.summarize())));
+        c = c.child(summary_actions(m));
     }
     column("summary", c, running)
 }
 
-/// Where the summary lives on disk, as the file shows it.
-fn saved_file(m: &Meeting) -> El {
+/// Rewrite the summary, and where it is saved, with a button to open the file.
+fn summary_actions(m: &Meeting) -> El {
     let name = m.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut c = col()
-        .key("saved-file")
+    let file = m.file.clone();
+    row()
+        .key("summary-actions")
         .w_full()
-        .mt(10.0)
-        .px(18.0)
-        .py(16.0)
-        .gap(8.0)
-        .radius(9.0)
-        .fill(P::well())
-        .border(1.0, P::line())
-        .child(text(name).font(mono(12.5)).color(P::secondary()))
-        .child(text("<!-- hushnote:summary -->").font(mono(12.5)).color(P::accent()));
-    for l in m.summary.lines().filter(|l| !l.trim().is_empty()).take(2) {
-        c = c.child(text(l.to_string()).font(mono(12.5)).color(P::text()).truncate());
-    }
-    c
+        .pt(10.0)
+        .gap(10.0)
+        .center_y()
+        .child(action_button("resummarize", "Rewrite summary", el(), |s: &mut Ui| s.summarize()))
+        .child(el().grow(1.0))
+        .child(text(name).font(mono(12.5)).color(P::dim()).truncate().min_w(0.0).shrink())
+        .child(chip_button("open-file", "Open file".into(), false, move |s: &mut Ui| s.open_file(&file)))
 }
 
 // ---- View: home and footer -------------------------------------------------------------------
@@ -1489,10 +1498,13 @@ fn footer(s: &Ui, m: Option<&Meeting>) -> El {
     };
     let right = match m {
         Some(m) if s.is_live(m) => row().key("meters").gap(22.0).center_y().child(meter("You", &s.meters.me)).child(meter("Them", &s.meters.them)),
-        Some(m) if s.view == View::Summary && !m.summary.trim().is_empty() => row()
-            .gap(22.0)
-            .child(text(format!("Summary by {}", s.config.llm_model)).font(sans(13.5, 400.0)).color(P::secondary()))
-            .child(text(minutes(m.duration_ms)).font(sans(13.5, 400.0)).color(P::secondary())),
+        Some(m) if s.view == View::Summary && !m.summary.trim().is_empty() => {
+            let mut r = row().gap(22.0);
+            if !m.summary_by.is_empty() {
+                r = r.child(text(format!("Summary by {}", m.summary_by)).font(sans(13.5, 400.0)).color(P::secondary()));
+            }
+            r.child(text(minutes(m.duration_ms)).font(sans(13.5, 400.0)).color(P::secondary()))
+        }
         Some(m) => row().child(text(format!("{} lines · {}", m.lines.len(), minutes(m.duration_ms))).font(sans(13.5, 400.0)).color(P::secondary())),
         None => row(),
     };
@@ -1571,10 +1583,12 @@ fn demo_meetings() -> Vec<Meeting> {
         line(Speaker::Me, 12, 38, "Okay, then Friday it is. Maya, can you own the pricing copy?"),
         line(Speaker::Them, 12, 41, "Yes, I'll send a draft on Wednesday"),
     ];
-    sync.summary = "## Decisions\n- The beta ships on `Friday`.\n- Maya owns the pricing page copy.\n- Acme gets a live demo on Monday, not a recording.\n\n\
+    sync.summary = "## Key points\n- Onboarding is done except for the sign-up bug.\n- The pricing page still has no copy.\n\n\
+                    ## Decisions\n- The beta ships on `Friday`.\n- Maya owns the pricing page copy.\n- Acme gets a live demo on Monday, not a recording.\n\n\
                     ## Action items\n- [ ] Dani fixes the sign-up bug · Thu\n- [ ] Maya sends the pricing copy · Wed\n- [x] Prepare the Acme demo · Mon\n\n\
                     ## Open questions\n- Does the free tier need a usage cap before launch?\n- Who runs the support inbox during the first week?"
         .into();
+    sync.summary_by = "Qwen3 4B".into();
     vec![
         sync,
         meeting("2026-11-16-acme-kickoff.md", "Acme kickoff call", "2026-11-16 15:00", 32),

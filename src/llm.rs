@@ -16,21 +16,68 @@ const PART_CHARS: usize = 8_000;
 const CLI_PART_CHARS: usize = 600_000;
 
 const SYSTEM: &str = "You are an assistant that writes clear, concise meeting notes in \
-Markdown. Always write in the same language the meeting was held in (the language of the \
-transcript), even though these instructions are in English. Use only what is in the transcript \
-and the user's notes; never invent facts. The transcript is automatic and may contain wrong \
-words: interpret them with common sense. \"You\" is the user; \"Them\" are the other \
-participants.";
+Markdown. Use only what is in the transcript and the user's notes; never invent facts. The \
+transcript is automatic and may contain wrong words: interpret them with common sense. \"You\" is \
+the user; \"Them\" are the other participants.";
 
-const FORMAT: &str = "Write the notes with exactly these three sections, with the headings \
-translated into the meeting's language:\n\
-## Decisions\n(bullets; \"None\" if there were none)\n\
-## Action items\n(a task list, one line each: `- [ ] Owner does the task · due`. Add ` · due` only \
-when a day or date was said, as a short word such as Thu or Mar 9. \"None\" if there were none)\n\
-## Open questions\n(bullets; \"None\" if there were none)\n\
-Put names, dates, amounts and product names in `inline code` sparingly, only when it helps \
-scanning. If the user took notes, honour them: they are what matters most to the user, so \
-expand them with details from the transcript. Add nothing before or after the sections.";
+/// The section headings, fixed per language so a small model can't half-translate them.
+struct Sections {
+    language: &'static str,
+    key_points: &'static str,
+    decisions: &'static str,
+    action_items: &'static str,
+    open_questions: &'static str,
+    none: &'static str,
+    /// How a due day looks, e.g. "Thu or Mar 9".
+    due: &'static str,
+}
+
+const SPANISH: Sections = Sections {
+    language: "Spanish",
+    key_points: "Puntos clave",
+    decisions: "Decisiones",
+    action_items: "Pendientes",
+    open_questions: "Preguntas abiertas",
+    none: "Ninguno",
+    due: "jue or 9 mar",
+};
+
+const ENGLISH: Sections = Sections {
+    language: "English",
+    key_points: "Key points",
+    decisions: "Decisions",
+    action_items: "Action items",
+    open_questions: "Open questions",
+    none: "None",
+    due: "Thu or Mar 9",
+};
+
+fn sections(language: &str) -> &'static Sections {
+    if language == "en" { &ENGLISH } else { &SPANISH }
+}
+
+/// What the notes must look like, with the headings written out in the meeting's language.
+fn format(s: &Sections) -> String {
+    format!(
+        "Write the notes in {lang}, with exactly these four sections and these exact headings:\n\
+         ## {kp}\n(3 to 6 bullets with the most important things that were said: facts, requirements, \
+         explanations, figures. Not the decisions or the tasks)\n\
+         ## {d}\n(bullets with what was decided or agreed; \"{none}\" if nothing was)\n\
+         ## {a}\n(a task list, one line each: `- [ ] Owner does the task · due`. Add ` · due` only \
+         when a day or date was said, as a short word such as {due}. \"{none}\" if there were none)\n\
+         ## {q}\n(bullets; \"{none}\" if there were none)\n\
+         Put names, dates, amounts and product names in `inline code` sparingly, only when it helps \
+         scanning. If the user took notes, honour them: they are what matters most to the user, so \
+         expand them with details from the transcript. Add nothing before or after the sections.",
+        lang = s.language,
+        kp = s.key_points,
+        d = s.decisions,
+        a = s.action_items,
+        q = s.open_questions,
+        none = s.none,
+        due = s.due,
+    )
+}
 
 pub struct Llm {
     pub provider: Summaries,
@@ -39,12 +86,41 @@ pub struct Llm {
     pub model: String,
     /// The model for a CLI provider; empty = the CLI's own default.
     pub cli_model: String,
+    /// The meeting's language, "es" or "en": the notes are written in it.
+    pub language: String,
 }
 
 impl Llm {
     pub fn from_config(c: &crate::config::Config) -> Llm {
-        Llm { provider: c.summaries, url: c.llm_url.clone(), model: c.llm_model.clone(), cli_model: c.summary_cli_model.clone() }
+        Llm {
+            provider: c.summaries,
+            url: c.llm_url.clone(),
+            model: c.llm_model.clone(),
+            cli_model: c.summary_cli_model.clone(),
+            language: c.language.clone(),
+        }
     }
+
+    /// Who writes the summary, for "Summary by …": "Qwen3 4B", "Claude", "Claude (sonnet)".
+    pub fn by(&self) -> String {
+        match self.provider {
+            Summaries::Local => model_name(&self.model),
+            p if self.cli_model.is_empty() => p.label().to_string(),
+            p => format!("{} ({})", p.label(), self.cli_model),
+        }
+    }
+}
+
+/// "qwen3:4b-instruct-2507-q4_K_M" → "Qwen3 4B": the family and the size of an Ollama tag.
+pub fn model_name(tag: &str) -> String {
+    let (family, variant) = tag.split_once(':').unwrap_or((tag, ""));
+    let mut name: String = family.chars().take(1).flat_map(char::to_uppercase).chain(family.chars().skip(1)).collect();
+    let size = variant.split('-').next().unwrap_or("");
+    if !size.is_empty() && size != "latest" {
+        name.push(' ');
+        name.push_str(&size.to_uppercase());
+    }
+    name
 }
 
 impl Summaries {
@@ -313,9 +389,10 @@ impl Llm {
             for (i, piece) in pieces.iter().enumerate() {
                 let prompt = format!(
                     "This is part {} of {} of a meeting. Extract the key points, decisions and \
-                     action items (with owners) as bullets, in the meeting's language. Bullets only.\n\n{piece}",
+                     action items (with owners) as bullets, in {}. Bullets only.\n\n{piece}",
                     i + 1,
-                    pieces.len()
+                    pieces.len(),
+                    sections(&self.language).language
                 );
                 let summary = self.chat(SYSTEM, &prompt, |_| {})?;
                 partial.push_str(&format!("### Part {}\n{summary}\n\n", i + 1));
@@ -323,13 +400,16 @@ impl Llm {
             format!("Partial notes of the meeting, in order:\n{partial}")
         };
         let notes = if notes.trim().is_empty() { "(the user took no notes)".to_string() } else { notes.to_string() };
-        let prompt = format!("The user's notes:\n{notes}\n\n{material}\n\n{FORMAT}");
+        let prompt = format!("The user's notes:\n{notes}\n\n{material}\n\n{}", format(sections(&self.language)));
         self.chat(SYSTEM, &prompt, on_delta)
     }
 
     /// A short title for the meeting.
     pub fn title(&self, summary: &str) -> Result<String, String> {
-        let prompt = format!("Write a 3 to 6 word title for this meeting, in the meeting's language, without quotes or a final period:\n\n{summary}");
+        let prompt = format!(
+            "Write a 3 to 6 word title for this meeting, in {}, without quotes or a final period:\n\n{summary}",
+            sections(&self.language).language
+        );
         let t = self.chat(SYSTEM, &prompt, |_| {})?;
         Ok(t.lines().next().unwrap_or("").trim_matches(['"', '#', ' ', '*']).to_string())
     }
@@ -378,13 +458,28 @@ mod tests {
         ];
         let wanted = std::env::var("HUSHNOTE_CLI").unwrap_or_else(|_| "claude,codex,opencode".into());
         for provider in Summaries::ALL.into_iter().filter(|p| wanted.contains(&p.label().to_lowercase())) {
-            let llm = Llm { provider, url: String::new(), model: String::new(), cli_model: String::new() };
+            let llm = Llm { provider, url: String::new(), model: String::new(), cli_model: String::new(), language: "es".into() };
             let start = std::time::Instant::now();
             let summary = llm.summarize("", &lines, |_| {}).unwrap_or_else(|e| panic!("{e}"));
             let title = llm.title(&summary).unwrap();
             println!("=== {} ({:.1} s) · {title}\n{summary}\n", provider.label(), start.elapsed().as_secs_f32());
-            assert!(summary.contains("- [ ]") && summary.matches("## ").count() == 3, "{summary}");
+            assert!(summary.contains("- [ ]") && summary.matches("## ").count() == 4, "{summary}");
+            assert!(["## Puntos clave", "## Decisiones", "## Pendientes", "## Preguntas abiertas"].iter().all(|h| summary.contains(h)), "{summary}");
         }
+    }
+
+    #[test]
+    fn names_the_summary_model() {
+        assert_eq!(model_name("qwen3:4b-instruct-2507-q4_K_M"), "Qwen3 4B");
+        assert_eq!(model_name("llama3.2:3b"), "Llama3.2 3B");
+        assert_eq!(model_name("mistral"), "Mistral");
+    }
+
+    #[test]
+    fn headings_follow_the_language() {
+        let es = format(sections("es"));
+        assert!(es.contains("## Pendientes") && es.contains("in Spanish") && !es.contains("## Action items"));
+        assert!(format(sections("en")).contains("## Action items"));
     }
 
     #[test]

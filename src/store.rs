@@ -15,6 +15,8 @@ pub struct Meeting {
     pub duration_ms: u64,
     pub notes: String,
     pub summary: String,
+    /// Who wrote the summary: "Qwen3 4B", "Claude"…
+    pub summary_by: String,
     pub lines: Vec<Line>,
 }
 
@@ -34,13 +36,11 @@ impl Meeting {
     }
 
     pub fn to_markdown(&self) -> String {
-        let mut md = format!(
-            "---\ntitle: \"{}\"\ndate: {}\nduration: {}\n---\n\n# {}\n\n",
-            self.title.replace('"', "'"),
-            self.date,
-            clock(self.duration_ms),
-            self.title
-        );
+        let mut md = format!("---\ntitle: \"{}\"\ndate: {}\nduration: {}\n", self.title.replace('"', "'"), self.date, clock(self.duration_ms));
+        if !self.summary_by.is_empty() {
+            md.push_str(&format!("summary_by: {}\n", self.summary_by));
+        }
+        md.push_str(&format!("---\n\n# {}\n\n", self.title));
         md.push_str(&format!("{NOTES}\n## My notes\n\n{}\n\n", self.notes.trim()));
         md.push_str(&format!("{SUMMARY}\n{}\n\n", self.summary.trim()));
         md.push_str(&format!("{TRANSCRIPT}\n## Transcript\n\n"));
@@ -71,6 +71,7 @@ impl Meeting {
                         "title" => m.title = v,
                         "date" => m.date = v,
                         "duration" => m.duration_ms = parse_clock(&v).unwrap_or(0),
+                        "summary_by" => m.summary_by = v,
                         _ => {}
                     }
                 }
@@ -138,6 +139,7 @@ mod tests {
             duration_ms: 125_000,
             notes: "- review the budget\n- call Ana".into(),
             summary: "## Summary\nWe talked about the budget.\n\n## Action items\n- [ ] Call Ana".into(),
+            summary_by: "Claude".into(),
             lines: vec![
                 Line { speaker: Speaker::Me, t_ms: 5_000, text: "Hi, shall we start?".into() },
                 Line { speaker: Speaker::Them, t_ms: 65_000, text: "Yes: the budget first.".into() },
@@ -149,6 +151,7 @@ mod tests {
         assert_eq!(back.duration_ms, m.duration_ms);
         assert_eq!(back.notes, m.notes);
         assert_eq!(back.summary, m.summary);
+        assert_eq!(back.summary_by, m.summary_by);
         assert_eq!(back.lines, m.lines);
     }
 }

@@ -61,13 +61,24 @@ on the machine.** Main target: Linux on Omarchy (Hyprland, Wayland, PipeWire).
     offered. `summary_cli_model` picks their model (empty = their default). Tested here: the
     same Spanish meeting summarized correctly by all three (Claude ~6 s, Codex and OpenCode
     ~18 s).
-  Prompts are in English; the summary is written in the meeting's language, as
-  `## Decisions`, `## Action items` (`- [ ] Owner does the task · due`) and
-  `## Open questions`. With the local model long meetings are summarized in parts; the hosted
+  Prompts are in English; the summary is written in the language picked in the composer, with
+  four sections whose headings the app gives already translated (a 4B model left some in
+  English): Key points, Decisions, Action items (`- [ ] Owner does the task · due`) and Open
+  questions; in Spanish, Puntos clave, Decisiones, Pendientes and Preguntas abiertas. The
+  meeting file records who wrote the summary (`summary_by:` in the front matter). With the local model long meetings are summarized in parts; the hosted
   ones take the whole meeting. `<think>` blocks are filtered.
 - **Languages (for now Spanish and English):** the composer's language picker also picks the
   speech model, as Hex recommends: Spanish → Parakeet v3, English → Parakeet Unified English.
-  Switching to one that isn't downloaded offers its one-click Download.
+  Switching to one that isn't downloaded offers its one-click Download. Parakeet v3 ignores the
+  language hint (only prompt-conditioned Parakeet variants read it), and alone a short phrase
+  could come out in the wrong language ("Sì, claro") or misheard ("lo vemos Mayara"). So each
+  phrase is transcribed after the last 5 s of the same person's speech and only the words past
+  that point are kept (word timestamps); if it still has letters Spanish/English don't use, it
+  is retried with 15 s. On a conversation of short phrases this fixed every slip seen without
+  context, for ~0.25 s more per phrase. Canary 1B, Nemotron 3.5 and Whisper turbo, which do take
+  a language, were worse on Spanish with English tech words or far too slow on CPU.
+  The app reads the model file once at start (and on a language switch) so the first meeting
+  doesn't wait on the disk; that only fills the page cache.
 - **One-click setup (Home › Set up), as in Hex:** the speech model downloads from the app
   (resumable, sha256-checked, with progress and Cancel; Silero VAD comes along), and the
   composer offers Download instead of Record while it is missing. The summary model is pulled
