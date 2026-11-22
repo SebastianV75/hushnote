@@ -1,5 +1,5 @@
 //! The window, laid out like OpenCode: a sidebar without a background of its own (Home,
-//! Search meetings, New meeting, then the meetings), and a bordered main panel with the live
+//! Search, New session, New notebook, then the notebooks, one group per subject), and a bordered main panel with the live
 //! transcript as a chat in a 720 point column, a composer for "My notes", and a footer with the
 //! notes folder and the You/Them level meters. After the meeting the summary reads like an
 //! assistant's answer: Key points, Decisions, Action items (checkboxes, due day on the right)
@@ -10,9 +10,10 @@
 
 use crate::audio::Speaker;
 use crate::config::{Config, Summaries};
-use crate::llm::{Llm, clock};
+use crate::export;
+use crate::llm::{self, Llm, Scope, clock};
 use crate::session::{Event, Line, Recording};
-use crate::store::{self, Meeting};
+use crate::store::{self, Card, Meeting, Mode, Turn};
 use rune::tok::TextStyle;
 use rune::{
     Align, App, AppSpec, Color, Cx, El, Icon, Live, OverlayHandle, OverlaySpec, ScreenEdge, ScrollSpec, TextEdit, Tx,
@@ -52,7 +53,6 @@ impl P {
     fn clear() -> Color { Color { a: 0.0, ..hex("#141415") } }
 }
 
-const AVATARS: [&str; 6] = ["#A8346F", "#1F7A8C", "#8A3FA0", "#B5481E", "#8F2A2A", "#3F6FB5"];
 
 const FONTS: &[&[u8]] = &[include_bytes!("../fonts/geist.ttf"), include_bytes!("../fonts/geist-mono.ttf")];
 const FAMILIES: (&str, &str) = ("Geist", "Geist Mono");
@@ -85,9 +85,38 @@ static CHEVRON: Icon = Icon {
     body: r#"<path d="M4.5 6.5L8 10L11.5 6.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+static CHEVRON_RIGHT: Icon = Icon {
+    name: "hn-chevron-right",
+    view: 16.0,
+    body: r#"<path d="M6.5 4.5L10 8L6.5 11.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+static PLUS: Icon = Icon {
+    name: "hn-plus",
+    view: 16.0,
+    body: r#"<path d="M8 3.5V12.5M3.5 8H12.5" stroke="currentColor" stroke-linecap="round"/>"#,
+};
+static BOOK: Icon = Icon {
+    name: "hn-book",
+    view: 16.0,
+    body: r#"<path d="M3.5 3.25A1.25 1.25 0 0 1 4.75 2H12.5V11.5H4.75A1.25 1.25 0 0 0 3.5 12.75Z" stroke="currentColor" stroke-linejoin="round"/><path d="M3.5 12.75A1.25 1.25 0 0 0 4.75 14H12.5V11.5" stroke="currentColor" stroke-linejoin="round"/>"#,
+};
+static CHECK: Icon = Icon {
+    name: "hn-check",
+    view: 16.0,
+    body: r#"<path d="M3.5 8.6L6.6 11.6L12.5 4.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 const METER_BARS: usize = 5;
 const AUTOSAVE_S: f64 = 2.0;
 const COLUMN: f32 = 720.0;
+/// The column of Home and of a notebook cover: four cards of [`CARD_W`] across.
+const COLUMN_WIDE: f32 = 960.0;
+const CARD_W: f32 = 212.0;
+const CARD_H: f32 = 172.0;
+const CARD_GAP: f32 = 24.0;
+/// The sheets of a notebook cover: four across, like the folders.
+const SHEET_W: f32 = 212.0;
+const SHEET_H: f32 = 204.0;
 
 fn language_label(code: &str) -> String {
     models::LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, l)| l.to_string()).unwrap_or_else(|| code.to_uppercase())
@@ -101,10 +130,11 @@ fn tilde(path: &Path) -> String {
     }
 }
 
-/// A meeting's avatar colour, stable for its file.
-fn avatar_color(m: &Meeting) -> Color {
-    let h = m.file.to_string_lossy().bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
-    hex(AVATARS[h as usize % AVATARS.len()])
+/// "2026-11-18 09:00" → "18 Nov".
+fn short_date(date: &str) -> String {
+    chrono::NaiveDate::parse_from_str(date.get(..10).unwrap_or(""), "%Y-%m-%d")
+        .map(|d| d.format("%-d %b").to_string())
+        .unwrap_or_default()
 }
 
 /// "2026-11-17 10:00" → "Tue 17 Nov".
@@ -128,6 +158,19 @@ fn minutes(ms: u64) -> String {
 enum View {
     Transcript,
     Summary,
+    /// A class's review questions, one card at a time.
+    Review,
+    /// A chat about the session's notes, or about all the classes of its subject.
+    Ask,
+}
+
+/// A question being answered: the answer so far shows in the chat.
+struct Asking {
+    file: PathBuf,
+    question: String,
+    /// The subject when it is about all its classes, else empty.
+    scope: String,
+    partial: String,
 }
 
 enum Rec {
@@ -144,6 +187,12 @@ enum LlmMsg {
     /// The summary, and who wrote it ("Qwen3 4B", "Claude"…).
     Done(PathBuf, Result<String, String>, String),
     Title(PathBuf, String),
+    /// The review questions, or why they could not be written.
+    Review(PathBuf, Result<Vec<Card>, String>),
+    /// A piece of the answer to a question about the file's session.
+    AskDelta(PathBuf, String),
+    /// The whole answer, or why there is none.
+    Asked(PathBuf, Result<String, String>),
     State(ollama::State),
 }
 
@@ -188,8 +237,12 @@ fn set_meter(bars: &[Live<Color>], level: f32) {
 pub struct Ui {
     config: Config,
     meetings: Vec<Meeting>,
-    /// `None` is Home.
+    /// `None` is Home, or a notebook cover when `notebook` is set.
     selected: Option<usize>,
+    /// The notebook cover on screen (`store::Group::key`); only with `selected == None`.
+    notebook: Option<String>,
+    /// The cover is running "Review all": the flashcards of every class of the notebook.
+    nb_review: bool,
     notes: TextEdit,
     view: View,
     rec: Rec,
@@ -200,6 +253,16 @@ pub struct Ui {
     wake: Waker,
     meters: Meters,
     summarizing: Option<PathBuf>,
+    /// The class whose review questions are being written.
+    reviewing: Option<PathBuf>,
+    /// The card on screen in the review, and whether its answer is showing.
+    card: usize,
+    revealed: bool,
+    /// The question box of the Ask view.
+    ask_input: TextEdit,
+    /// Whether the Ask scope is all the classes of the subject (when that is possible).
+    ask_all: bool,
+    asking: Option<Asking>,
     /// A message for the footer, and whether it is a warning.
     status: Option<(String, bool)>,
     /// Meetings with something new (a summary arrived while looking elsewhere).
@@ -209,6 +272,10 @@ pub struct Ui {
     search: Option<TextEdit>,
     /// When the open meeting changed without being saved yet.
     dirty: Option<f64>,
+    /// The subject of the open session was edited since the last save: it may need a new folder.
+    subject_touched: bool,
+    /// Sessions that should move to their ideal path but are busy (recording, summarizing…).
+    relocate_pending: HashSet<PathBuf>,
     /// Scenes for screenshots fill in sample meetings that must never be written to disk.
     demo: bool,
     capsule: Option<OverlayHandle<Capsule>>,
@@ -219,6 +286,16 @@ pub struct Ui {
     llm_state: Option<ollama::State>,
     /// Screenshot scenes decide this instead of the disk.
     speech_ready_override: Option<bool>,
+    /// What "New session" creates; chosen before the recording starts.
+    new_mode: Mode,
+    /// The subject box in the header, for the open session.
+    subject: TextEdit,
+    /// Sidebar groups (`store::Group::key`) the user collapsed; everything starts open.
+    closed: HashSet<String>,
+    /// The "Notebook name" box of "New notebook", while it is open.
+    notebook_input: Option<TextEdit>,
+    /// The footer message of the last export and the folder it went to, for "Open folder".
+    exported: Option<(String, PathBuf)>,
 }
 
 impl Ui {
@@ -226,8 +303,11 @@ impl Ui {
         let config = Config::load();
         let meetings = store::list(&config.notes_dir);
         let notes = TextEdit::new(meetings.first().map(|m| m.notes.clone()).unwrap_or_default());
+        let subject = TextEdit::new(meetings.first().map(|m| m.subject.clone()).unwrap_or_default());
         let mut ui = Ui {
             selected: (!meetings.is_empty()).then_some(0),
+            notebook: None,
+            nb_review: false,
             meetings,
             config,
             notes,
@@ -239,11 +319,19 @@ impl Ui {
             wake: std::sync::Arc::new(|| {}),
             meters: Meters::new(),
             summarizing: None,
+            reviewing: None,
+            card: 0,
+            revealed: false,
+            ask_input: TextEdit::new(""),
+            ask_all: false,
+            asking: None,
             status: None,
             unseen: HashSet::new(),
             warned: HashSet::new(),
             search: None,
             dirty: None,
+            subject_touched: false,
+            relocate_pending: HashSet::new(),
             demo: false,
             capsule,
             capsule_shown: Default::default(),
@@ -251,6 +339,11 @@ impl Ui {
             dl: mpsc::channel(),
             llm_state: None,
             speech_ready_override: None,
+            new_mode: Mode::Meeting,
+            subject,
+            closed: HashSet::new(),
+            notebook_input: None,
+            exported: None,
         };
         if let Some(m) = ui.current() {
             ui.view = default_view(m);
@@ -309,7 +402,7 @@ impl Ui {
                     }
                 })
                 .and_then(|_| models::VAD.download(&cancel, |_, _| {}))
-                .map(|_| format!("{} is ready. Press New meeting to start.", artifact.name));
+                .map(|_| format!("{} is ready. Press New session to start.", artifact.name));
             let _ = tx.send(DlMsg::Done(Fetch::Speech, result));
             wake();
         });
@@ -396,7 +489,7 @@ impl Ui {
         }
         if let Some(m) = self.meetings.get(i) {
             if let Err(e) = m.save() {
-                self.warn(format!("Could not save the meeting: {e}"));
+                self.warn(format!("Could not save the session: {e}"));
             }
         }
     }
@@ -404,13 +497,83 @@ impl Ui {
     fn save_current(&mut self) {
         if let Some(i) = self.selected {
             self.save(i);
+            if std::mem::take(&mut self.subject_touched) {
+                let file = self.meetings[i].file.clone();
+                self.try_relocate(&file);
+            }
         }
         self.dirty = None;
+    }
+
+    /// Moves the session at `file` to its ideal path (subject folder, readable name), or marks
+    /// it pending when it is busy and tries again later. References by path follow the move.
+    fn try_relocate(&mut self, file: &Path) {
+        if self.demo {
+            return;
+        }
+        let Some(i) = self.index_of(file) else {
+            self.relocate_pending.remove(file);
+            return;
+        };
+        let busy = [self.rec_file(), self.summarizing.as_deref(), self.reviewing.as_deref(), self.asking.as_ref().map(|a| a.file.as_path())];
+        if !store::may_relocate(file, &busy) {
+            self.relocate_pending.insert(file.to_path_buf());
+            return;
+        }
+        self.relocate_pending.remove(file);
+        let taken: Vec<PathBuf> = self.meetings.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, m)| m.file.clone()).collect();
+        let notes_dir = self.config.notes_dir.clone();
+        match self.meetings[i].relocate(&notes_dir, &taken) {
+            Ok(Some(old)) => {
+                let new = self.meetings[i].file.clone();
+                if self.unseen.remove(&old) {
+                    self.unseen.insert(new.clone());
+                }
+                if self.warned.remove(&old) {
+                    self.warned.insert(new);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.warn(format!("Could not move the session: {e}")),
+        }
+    }
+
+    /// Retries the moves that were postponed because the session was busy.
+    fn retry_relocations(&mut self) {
+        if self.relocate_pending.is_empty() {
+            return;
+        }
+        let pending: Vec<PathBuf> = self.relocate_pending.iter().cloned().collect();
+        for file in pending {
+            self.try_relocate(&file);
+        }
     }
 
     fn go_home(&mut self) {
         self.save_current();
         self.selected = None;
+        self.notebook = None;
+        self.nb_review = false;
+    }
+
+    /// Shows the cover of the notebook `key` (`store::Group::key`).
+    fn open_notebook(&mut self, key: &str) {
+        self.save_current();
+        self.selected = None;
+        self.notebook = Some(key.to_string());
+        self.nb_review = false;
+        self.reset_review();
+    }
+
+    /// The group on the cover on screen, if it still has sessions.
+    fn cover(&self) -> Option<store::Group> {
+        let key = self.notebook.as_ref()?;
+        store::notebooks(&self.meetings).into_iter().find(|g| &g.key == key)
+    }
+
+    /// The flashcards "Review all" goes through: `(session, card)` pairs of the open cover.
+    fn deck(&self) -> Vec<(usize, usize)> {
+        self.cover().map(|g| store::review_deck(&self.meetings, &g.indices)).unwrap_or_default()
     }
 
     fn select(&mut self, i: usize) {
@@ -419,23 +582,51 @@ impl Ui {
         }
         self.save_current();
         self.selected = Some(i);
+        self.notebook = None;
+        self.nb_review = false;
         self.notes = TextEdit::new(self.meetings[i].notes.clone());
+        self.subject = TextEdit::new(self.meetings[i].subject.clone());
         self.view = default_view(&self.meetings[i]);
+        self.reset_review();
+        self.ask_all = false;
+        self.ask_input = TextEdit::new("");
         let file = self.meetings[i].file.clone();
         self.unseen.remove(&file);
     }
 
+    /// "New session": what the Mode chip says, with no subject.
     fn new_meeting(&mut self) {
+        self.new_session(self.new_mode, String::new());
+    }
+
+    /// "New notebook": a first class under the typed name.
+    fn confirm_notebook(&mut self) {
+        let Some(name) = self.notebook_input.as_ref().map(|e| e.text.split_whitespace().collect::<Vec<_>>().join(" ")) else { return };
+        if name.is_empty() || !matches!(self.rec, Rec::Idle) {
+            return;
+        }
+        self.notebook_input = None;
+        self.new_session(Mode::Class, name);
+    }
+
+    /// Creates a session of `mode` in `subject` and starts recording it.
+    fn new_session(&mut self, mode: Mode, subject: String) {
         if !matches!(self.rec, Rec::Idle) {
             return;
         }
         if !self.speech_ready() {
             self.selected = None;
+            self.notebook = None;
             self.download_speech();
             self.status = Some(("Downloading the speech model first. It only happens once.".into(), false));
             return;
         }
-        let meeting = Meeting::new(&self.config.notes_dir);
+        let mut meeting = Meeting::new(&self.config.notes_dir, mode);
+        meeting.subject = subject;
+        // New sessions start in their subject's folder, named by date and time until the title arrives.
+        if let Some(name) = meeting.file.file_name().map(|n| n.to_os_string()) {
+            meeting.file = store::subject_dir(&self.config.notes_dir, &meeting.subject).join(name);
+        }
         self.save_current();
         self.meetings.insert(0, meeting);
         self.selected = None;
@@ -510,7 +701,7 @@ impl Ui {
         }
         let m = &self.meetings[i];
         let (file, notes, lines) = (m.file.clone(), self.notes.text.clone(), m.lines.clone());
-        let llm = Llm::from_config(&self.config);
+        let llm = Llm::from_config(&self.config).with_mode(m.mode);
         let by = llm.by();
         let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
         self.meetings[i].summary.clear();
@@ -530,7 +721,171 @@ impl Ui {
         });
     }
 
+    /// The subject and the sessions in it, when the open session can be asked about all of
+    /// them: it has a subject and at least one other session shares it.
+    fn ask_subject(&self) -> Option<(String, Vec<&Meeting>)> {
+        let m = self.current()?;
+        let name = m.subject.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            return None;
+        }
+        let all: Vec<&Meeting> = self.meetings.iter().filter(|o| store::matches_subject(o, Some(&name))).collect();
+        (all.len() > 1).then_some((name, all))
+    }
+
+    /// Sends the question in the box, in the background; the answer streams into the chat.
+    fn ask(&mut self) {
+        let Some(i) = self.selected else { return };
+        let question = self.ask_input.text.trim().to_string();
+        let m = &self.meetings[i];
+        if self.asking.is_some() || question.is_empty() || (m.summary.trim().is_empty() && m.lines.is_empty()) {
+            return;
+        }
+        let llm = Llm::from_config(&self.config).with_mode(m.mode);
+        let history = m.questions.clone();
+        let budget = llm.ask_budget(&history, &question);
+        let (scope, context) = match self.ask_subject().filter(|_| self.ask_all) {
+            Some((name, classes)) => {
+                let ctx = llm::ask_context(&Scope::Subject { name: &name, classes }, budget);
+                (name, ctx)
+            }
+            None => (String::new(), llm::ask_context(&Scope::Session(m), budget)),
+        };
+        let file = m.file.clone();
+        let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
+        self.asking = Some(Asking { file: file.clone(), question: question.clone(), scope, partial: String::new() });
+        self.ask_input = TextEdit::new("");
+        self.view = View::Ask;
+        std::thread::spawn(move || {
+            let send = |msg: LlmMsg| {
+                let _ = tx.send(msg);
+                wake();
+            };
+            let result = llm.ask(&context, &history, &question, |d| send(LlmMsg::AskDelta(file.clone(), d.to_string())));
+            send(LlmMsg::Asked(file, result));
+        });
+    }
+
+    fn clear_questions(&mut self) {
+        let Some(i) = self.selected else { return };
+        if self.asking.is_some() || self.meetings[i].questions.is_empty() {
+            return;
+        }
+        self.meetings[i].questions.clear();
+        self.save(i);
+    }
+
+    fn reset_review(&mut self) {
+        self.card = 0;
+        self.revealed = false;
+    }
+
+    /// Moves to another card (`delta` of -1 or 1, stopping at the ends); its answer hides again.
+    fn step_card(&mut self, delta: isize) {
+        let len = if self.nb_review { self.deck().len() } else { self.current().map_or(0, |m| m.review.len()) };
+        let to = step(self.card, len, delta);
+        if to != self.card {
+            self.card = to;
+            self.revealed = false;
+        }
+    }
+
+    /// Writes the class's review questions in the background. The old ones stay until the new
+    /// ones arrive.
+    fn generate_review(&mut self) {
+        let Some(i) = self.selected else { return };
+        let m = &self.meetings[i];
+        if self.reviewing.is_some() || m.mode != Mode::Class || (m.summary.trim().is_empty() && m.lines.is_empty()) {
+            return;
+        }
+        let (file, summary, notes, lines) = (m.file.clone(), m.summary.clone(), self.notes.text.clone(), m.lines.clone());
+        let llm = Llm::from_config(&self.config).with_mode(m.mode);
+        let (tx, wake) = (self.llm.0.clone(), self.wake.clone());
+        self.reviewing = Some(file.clone());
+        self.reset_review();
+        self.view = View::Review;
+        std::thread::spawn(move || {
+            let result = llm.review(&summary, &notes, &lines);
+            let _ = tx.send(LlmMsg::Review(file, result));
+            wake();
+        });
+    }
+
     /// Opens a meeting's Markdown file in the user's default editor.
+    /// Writes an export for the open session and says where it went in the footer.
+    fn export(&mut self, anki: bool) {
+        let Some(m) = self.current() else { return };
+        if anki && m.review.is_empty() {
+            self.warn("No review questions to export yet. Generate the review first.");
+            return;
+        }
+        if self.demo {
+            self.warn("Demo mode: nothing is written to disk.");
+            return;
+        }
+        let dir = &self.config.notes_dir;
+        let (path, content) = if anki {
+            (export::anki_path(dir, m), export::export_anki_csv(&m.review))
+        } else {
+            (export::markdown_path(dir, m), export::export_markdown(m))
+        };
+        match export::write_atomic(&path, &content) {
+            Ok(()) => {
+                let msg = format!("Exported to {}", tilde(&path));
+                self.exported = Some((msg.clone(), export::export_dir(&self.config.notes_dir)));
+                self.status = Some((msg, false));
+            }
+            Err(e) => self.warn(format!("Could not export: {e}")),
+        }
+    }
+
+    /// "New class" on a cover: a class in this notebook, or a meeting on Meetings.
+    fn new_in(&mut self, g: &store::Group) {
+        match g.kind {
+            store::GroupKind::Notebook => self.new_session(Mode::Class, g.title.clone()),
+            store::GroupKind::Unsorted => self.new_session(Mode::Class, String::new()),
+            store::GroupKind::Meetings => self.new_session(Mode::Meeting, String::new()),
+        }
+    }
+
+    /// "Ask this notebook": the newest session with something to ask about, with the scope on
+    /// all the classes of the subject.
+    fn ask_notebook(&mut self) {
+        let Some(g) = self.cover() else { return };
+        let askable = |m: &Meeting| !m.summary.trim().is_empty() || !m.lines.is_empty();
+        let Some(i) = store::most_recent(&self.meetings, &g.indices, g.indices.len()).into_iter().find(|&i| askable(&self.meetings[i])) else { return };
+        self.select(i);
+        self.view = View::Ask;
+        self.ask_all = true;
+    }
+
+    /// Writes the notebook's study document and its Anki CSV, and says where in the footer.
+    fn export_notebook(&mut self) {
+        let Some(g) = self.cover() else { return };
+        if self.demo {
+            self.warn("Demo mode: nothing is written to disk.");
+            return;
+        }
+        let order = store::chronological(&self.meetings, &g.indices);
+        let sessions: Vec<&Meeting> = order.iter().map(|&i| &self.meetings[i]).collect();
+        let dir = &self.config.notes_dir;
+        let md = export::notebook_markdown_path(dir, &g.title);
+        let mut result = export::write_atomic(&md, &export::export_notebook_markdown(&g.title, &sessions));
+        let cards = sessions.iter().any(|m| !m.review.is_empty());
+        if result.is_ok() && cards {
+            result = export::write_atomic(&export::notebook_anki_path(dir, &g.title), &export::export_notebook_anki_csv(&sessions));
+        }
+        match result {
+            Ok(()) => {
+                let what = if cards { "Markdown and Anki CSV" } else { "Markdown (no flashcards yet)" };
+                let msg = format!("Exported {} ({what}) to {}", g.title, tilde(&export::export_dir(dir)));
+                self.exported = Some((msg.clone(), export::export_dir(dir)));
+                self.status = Some((msg, false));
+            }
+            Err(e) => self.warn(format!("Could not export: {e}")),
+        }
+    }
+
     fn open_file(&mut self, file: &std::path::Path) {
         match std::process::Command::new("xdg-open").arg(file).spawn() {
             // Reap it so it doesn't linger as a zombie.
@@ -626,6 +981,8 @@ impl Ui {
                             self.summarize();
                         }
                     }
+                    // Moves postponed while recording can happen now (not if the summary just started).
+                    self.retry_relocations();
                 }
             }
         }
@@ -680,12 +1037,65 @@ impl Ui {
                         }
                     }
                 }
+                LlmMsg::Review(file, result) => {
+                    self.reviewing = None;
+                    let i = self.index_of(&file);
+                    match result {
+                        Ok(cards) => {
+                            self.warned.remove(&file);
+                            if let Some(i) = i {
+                                self.meetings[i].review = cards;
+                                self.save(i);
+                                if self.selected == Some(i) {
+                                    self.reset_review();
+                                } else {
+                                    self.unseen.insert(file);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.warned.insert(file);
+                            self.warn(e);
+                            // Nothing to show on the review screen: go back to the summary.
+                            if self.view == View::Review && self.current().is_some_and(|m| m.review.is_empty()) {
+                                self.view = View::Summary;
+                            }
+                        }
+                    }
+                }
+                LlmMsg::AskDelta(file, delta) => {
+                    if let Some(a) = self.asking.as_mut().filter(|a| a.file == file) {
+                        a.partial.push_str(&delta);
+                    }
+                }
+                LlmMsg::Asked(file, result) => {
+                    let Some(a) = self.asking.take().filter(|a| a.file == file) else { continue };
+                    match result {
+                        Ok(answer) => {
+                            if let Some(i) = self.index_of(&file) {
+                                self.meetings[i].questions.push(Turn { question: a.question, answer, scope: a.scope });
+                                self.save(i);
+                                if self.selected != Some(i) {
+                                    self.unseen.insert(file);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Nothing is lost: the question goes back in the box to try again.
+                            if self.selected == self.index_of(&file) && self.ask_input.text.trim().is_empty() {
+                                self.ask_input = TextEdit::new(a.question);
+                            }
+                            self.warn(e);
+                        }
+                    }
+                }
                 LlmMsg::State(state) => self.llm_state = Some(state),
                 LlmMsg::Title(file, title) => {
                     if let Some(i) = self.index_of(&file) {
-                        if self.meetings[i].title.starts_with("Meeting on") {
+                        if self.meetings[i].title.starts_with("Meeting on") || self.meetings[i].title.starts_with("Class on") {
                             self.meetings[i].title = title;
                             self.save(i);
+                            self.try_relocate(&file);
                         }
                     }
                 }
@@ -720,10 +1130,19 @@ impl Ui {
             return true;
         };
         m.title.to_lowercase().contains(&q)
+            || m.subject.to_lowercase().contains(&q)
             || m.notes.to_lowercase().contains(&q)
             || m.summary.to_lowercase().contains(&q)
             || m.lines.iter().any(|l| l.text.to_lowercase().contains(&q))
     }
+}
+
+/// The card after moving `delta` from `at` in a deck of `len`, stopping at the first and last.
+fn step(at: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    at.saturating_add_signed(delta).min(len - 1)
 }
 
 fn default_view(m: &Meeting) -> View {
@@ -738,6 +1157,7 @@ fn setup(s: &mut Ui, waker: Waker) {
 fn poll(s: &mut Ui, t: f64, tx: &mut Tx) -> bool {
     s.now = t;
     let mut changed = s.drain();
+    s.retry_relocations();
     if let Some(since) = s.dirty {
         if t - since >= AUTOSAVE_S && !matches!(s.rec, Rec::Live { .. }) {
             s.save_current();
@@ -791,22 +1211,13 @@ fn nav_item(key: &str, glyph: &'static Icon, label: &str, active: bool, on: impl
         .child(text(label.to_string()).font(sans(14.5, 400.0)).color(P::text()))
 }
 
-fn avatar(m: &Meeting) -> El {
-    let initial = m.title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "·".into());
-    el().size(20.0, 20.0)
-        .radius(5.0)
-        .fill(avatar_color(m))
-        .center()
-        .child(text(initial).font(sans(11.0, 650.0)).color(hex("#FFFFFF")))
-}
-
 fn dot(color: Color) -> El {
     el().size(7.0, 7.0).radius(3.5).fill(color)
 }
 
 fn sidebar(s: &Ui) -> El {
     let mut nav = col().w_full().gap(2.0);
-    nav = nav.child(nav_item("nav-home", &HOME, "Home", s.selected.is_none(), |s: &mut Ui| s.go_home()));
+    nav = nav.child(nav_item("nav-home", &HOME, "Home", s.selected.is_none() && s.notebook.is_none(), |s: &mut Ui| s.go_home()));
     nav = match &s.search {
         Some(edit) => nav.child(
             row()
@@ -826,7 +1237,7 @@ fn sidebar(s: &Ui) -> El {
                         .grow(1.0)
                         .min_w(0.0)
                         .color(P::text())
-                        .placeholder("Search meetings", P::dim())
+                        .placeholder("Search", P::dim())
                         .caret(P::accent(), Color { a: 0.35, ..P::accent() })
                         .on_edit(|s: &mut Ui| s.search.as_mut().expect("search open"))
                         .on_input_key(|s: &mut Ui, ev: &rune::KeyEvent, _: &mut Tx| {
@@ -838,63 +1249,92 @@ fn sidebar(s: &Ui) -> El {
                         }),
                 ),
         ),
-        None => nav.child(nav_item("nav-search", &SEARCH, "Search meetings", false, |s: &mut Ui| {
+        None => nav.child(nav_item("nav-search", &SEARCH, "Search", false, |s: &mut Ui| {
             s.search = Some(TextEdit::new(""));
         })),
     };
     let recording = !matches!(s.rec, Rec::Idle);
-    let mut new = nav_item("nav-new", &NEW, "New meeting", false, |s: &mut Ui| s.new_meeting());
+    let mut new = nav_item("nav-new", &NEW, "New session", false, |s: &mut Ui| s.new_meeting());
     if recording {
         new = new.opacity(0.45);
     }
     nav = nav.child(new);
+    nav = nav.child(
+        row().w_full().pl(34.0).child(
+            chip_button("new-mode", format!("Mode · {}", s.new_mode.label()), true, |s: &mut Ui| s.new_mode = s.new_mode.next())
+                .help("What the next session is. Classes get notes with topics, concepts, formulas and tasks."),
+        ),
+    );
+    nav = match &s.notebook_input {
+        Some(edit) => nav.child(
+            row()
+                .key("nav-notebook")
+                .w_full()
+                .h(36.0)
+                .px(10.0)
+                .gap(12.0)
+                .center_y()
+                .radius(9.0)
+                .fill(P::raised())
+                .border(1.0, P::line())
+                .child(icon(&BOOK, 17.0).color(P::secondary()))
+                .child(
+                    text_input(edit, sans(14.5, 400.0))
+                        .key("notebook-input")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .color(P::text())
+                        .placeholder("Notebook name", P::dim())
+                        .caret(P::accent(), Color { a: 0.35, ..P::accent() })
+                        .on_edit(|s: &mut Ui| s.notebook_input.as_mut().expect("notebook box open"))
+                        .on_input_key(|s: &mut Ui, ev: &rune::KeyEvent, _: &mut Tx| match ev.key {
+                            rune::Key::Escape => {
+                                s.notebook_input = None;
+                                true
+                            }
+                            rune::Key::Enter => {
+                                s.confirm_notebook();
+                                true
+                            }
+                            _ => false,
+                        }),
+                ),
+        ),
+        None => {
+            let mut item = nav_item("nav-notebook", &BOOK, "New notebook", false, |s: &mut Ui| {
+                if matches!(s.rec, Rec::Idle) {
+                    let mut edit = TextEdit::new("");
+                    edit.focused = true;
+                    s.notebook_input = Some(edit);
+                }
+            });
+            if recording {
+                item = item.opacity(0.45);
+            }
+            nav.child(item)
+        }
+    };
 
     let mut list = col().key("meetings").w_full().gap(2.0);
+    let groups = store::notebooks(&s.meetings);
     let mut shown = 0;
-    for (i, m) in s.meetings.iter().enumerate() {
-        if !s.matches_search(m) {
+    for g in &groups {
+        let hits: Vec<usize> = g.indices.iter().copied().filter(|&i| s.matches_search(&s.meetings[i])).collect();
+        if hits.is_empty() {
             continue;
         }
-        shown += 1;
-        let selected = s.selected == Some(i);
-        let marker = if s.rec_file() == Some(m.file.as_path()) {
-            Some(P::rec())
-        } else if s.warned.contains(&m.file) {
-            Some(P::warn())
-        } else if s.unseen.contains(&m.file) {
-            Some(P::accent())
-        } else {
-            None
-        };
-        let mut r = row()
-            .key(format!("meeting-{i}"))
-            .w_full()
-            .h(38.0)
-            .px(10.0)
-            .gap(12.0)
-            .center_y()
-            .radius(9.0)
-            .fill(if selected { P::raised() } else { P::clear() })
-            .hover(P::raised())
-            .role("button")
-            .label(m.title.clone())
-            .on_press(move |s: &mut Ui| s.select(i))
-            .child(avatar(m))
-            .child(
-                text(m.title.clone())
-                    .font(sans(14.5, if selected { 500.0 } else { 400.0 }))
-                    .color(if selected { P::text() } else { P::secondary() })
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            );
-        if let Some(c) = marker {
-            r = r.child(dot(c));
+        shown += hits.len();
+        let holds_selected = s.selected.is_some_and(|i| g.indices.contains(&i));
+        let open = holds_selected || !s.closed.contains(&g.key);
+        list = list.child(group_header(s, g, hits.len(), open));
+        if open {
+            for i in hits {
+                list = list.child(session_row(s, i));
+            }
         }
-        list = list.child(r);
     }
     if shown == 0 {
-        let msg = if s.meetings.is_empty() { "No meetings yet" } else { "Nothing matches" };
+        let msg = if s.meetings.is_empty() { "No sessions yet" } else { "Nothing matches" };
         list = list.child(text(msg).font(sans(13.0, 400.0)).color(P::dim()).px(10.0).py(8.0));
     }
 
@@ -912,6 +1352,106 @@ fn sidebar(s: &Ui) -> El {
         .child(list.scroll(ScrollSpec { stick_bottom: false }).grow(1.0).min_h(0.0))
 }
 
+/// A notebook's heading: a chevron that opens and closes it, the name (opens the cover, and
+/// shows highlighted while the cover is on screen), the count and, on notebooks, a "+" for a
+/// new class in it.
+fn group_header(s: &Ui, g: &store::Group, count: usize, open: bool) -> El {
+    let key = g.key.clone();
+    let chevron = el()
+        .key(format!("group-{}", g.key))
+        .size(26.0, 28.0)
+        .radius(7.0)
+        .center()
+        .hover(P::raised())
+        .role("button")
+        .label(format!("{} {}", if open { "Collapse" } else { "Expand" }, g.title))
+        .on_press(move |s: &mut Ui| {
+            if !s.closed.remove(&key) {
+                s.closed.insert(key.clone());
+            }
+        })
+        .child(icon(if open { &CHEVRON } else { &CHEVRON_RIGHT }, 14.0).color(P::dim()));
+    let on_cover = s.notebook.as_ref() == Some(&g.key);
+    let open_key = g.key.clone();
+    let name = row()
+        .key(format!("group-open-{}", g.key))
+        .grow(1.0)
+        .min_w(0.0)
+        .h(32.0)
+        .px(6.0)
+        .gap(6.0)
+        .center_y()
+        .radius(8.0)
+        .fill(if on_cover { P::raised() } else { P::clear() })
+        .hover(P::raised())
+        .role("button")
+        .label(format!("{} ({count})", g.title))
+        .on_press(move |s: &mut Ui| s.open_notebook(&open_key))
+        .child(text(g.title.clone()).font(sans(13.5, 550.0)).color(P::text()).truncate().min_w(0.0).shrink())
+        .child(text(format!("({count})")).font(sans(12.5, 400.0)).color(P::dim()));
+    let mut r = row().key(format!("group-row-{}", g.key)).w_full().gap(0.0).center_y().child(chevron).child(name);
+    if g.kind == store::GroupKind::Notebook {
+        let subject = g.title.clone();
+        let mut plus = el()
+            .key(format!("group-new-{}", g.key))
+            .size(26.0, 26.0)
+            .radius(7.0)
+            .center()
+            .hover(P::raised())
+            .role("button")
+            .label(format!("New class in {}", g.title))
+            .help("New class in this notebook")
+            .on_press(move |s: &mut Ui| s.new_session(Mode::Class, subject.clone()))
+            .child(icon(&PLUS, 15.0).color(P::dim()));
+        if !matches!(s.rec, Rec::Idle) {
+            plus = plus.opacity(0.45);
+        }
+        r = r.child(el().w(2.0)).child(plus);
+    }
+    r
+}
+
+/// One session in a notebook: title, the markers (recording, warning, unseen) and the short date.
+fn session_row(s: &Ui, i: usize) -> El {
+    let m = &s.meetings[i];
+    let selected = s.selected == Some(i);
+    let marker = if s.rec_file() == Some(m.file.as_path()) {
+        Some(P::rec())
+    } else if s.warned.contains(&m.file) {
+        Some(P::warn())
+    } else if s.unseen.contains(&m.file) {
+        Some(P::accent())
+    } else {
+        None
+    };
+    let mut r = row()
+        .key(format!("meeting-{i}"))
+        .w_full()
+        .h(34.0)
+        .pl(26.0)
+        .pr(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(9.0)
+        .fill(if selected { P::raised() } else { P::clear() })
+        .hover(P::raised())
+        .role("button")
+        .label(m.title.clone())
+        .on_press(move |s: &mut Ui| s.select(i))
+        .child(
+            text(m.title.clone())
+                .font(sans(14.5, if selected { 500.0 } else { 400.0 }))
+                .color(if selected { P::text() } else { P::secondary() })
+                .truncate()
+                .min_w(0.0)
+                .grow(1.0),
+        );
+    if let Some(c) = marker {
+        r = r.child(dot(c));
+    }
+    r.child(text(short_date(&m.date)).font(sans(12.5, 400.0)).color(P::dim()))
+}
+
 // ---- View: main panel -------------------------------------------------------------------------
 
 fn main_panel(s: &Ui) -> El {
@@ -921,9 +1461,15 @@ fn main_panel(s: &Ui) -> El {
             match s.view {
                 View::Transcript => (m.title.clone(), transcript_view(s, m), footer(s, Some(m))),
                 View::Summary => (m.title.clone(), summary_view(s, i, m), footer(s, Some(m))),
+                View::Review => (m.title.clone(), review_view(s, m), footer(s, Some(m))),
+                View::Ask => (m.title.clone(), ask_view(s, m), footer(s, Some(m))),
             }
         }
-        None => ("Home".to_string(), home_view(s), footer(s, None)),
+        None => match s.cover() {
+            Some(g) if s.nb_review => (g.title.clone(), notebook_review_view(s, &g), footer(s, None)),
+            Some(g) => (g.title.clone(), notebook_view(s, &g), footer(s, None)),
+            None => ("Home".to_string(), home_view(s), footer(s, None)),
+        },
     };
     col()
         .key("panel")
@@ -971,6 +1517,7 @@ fn header(s: &Ui, title: &str) -> El {
                     .child(text(clock(s.elapsed_ms())).font(mono(14.0)).color(P::text())),
             );
         } else {
+            right = right.child(subject_input(s));
             if !m.lines.is_empty() || !m.summary.trim().is_empty() {
                 right = right.child(view_switch(s));
             }
@@ -994,6 +1541,28 @@ fn header(s: &Ui, title: &str) -> El {
         .child(right)
 }
 
+/// The subject of the open session, saved with the same autosave as the notes.
+fn subject_input(s: &Ui) -> El {
+    row().key("subject-box").w(190.0).h(28.0).px(8.0).center_y().radius(6.0).fill(P::raised()).border(1.0, P::line()).child(
+        text_input(&s.subject, sans(13.0, 400.0))
+            .key("subject-input")
+            .grow(1.0)
+            .min_w(0.0)
+            .color(P::text())
+            .placeholder("Subject (e.g. Calculus I)", P::dim())
+            .caret(P::accent(), Color { a: 0.35, ..P::accent() })
+            .on_edit(|s: &mut Ui| &mut s.subject)
+            .on_input_change(|s: &mut Ui, tx: &mut Tx| {
+                if let Some(i) = s.selected {
+                    s.meetings[i].subject = s.subject.text.clone();
+                    s.subject_touched = true;
+                    s.dirty.get_or_insert(s.now);
+                    tx.wake_after(Duration::from_secs_f64(AUTOSAVE_S));
+                }
+            }),
+    )
+}
+
 fn view_switch(s: &Ui) -> El {
     let item = |key: &str, label: &str, v: View| {
         let on = s.view == v;
@@ -1008,15 +1577,27 @@ fn view_switch(s: &Ui) -> El {
             .role("tab")
             .on_press(move |s: &mut Ui| s.view = v)
     };
-    row().gap(2.0).child(item("view-transcript", "Transcript", View::Transcript)).child(item("view-summary", "Summary", View::Summary))
+    let mut r = row().gap(2.0).child(item("view-transcript", "Transcript", View::Transcript)).child(item("view-summary", "Summary", View::Summary));
+    if s.current().is_some_and(|m| !m.review.is_empty()) || s.reviewing.is_some() && s.view == View::Review {
+        r = r.child(item("view-review", "Review", View::Review));
+    }
+    if s.current().is_some_and(|m| !m.summary.trim().is_empty() || !m.lines.is_empty()) {
+        r = r.child(item("view-ask", "Ask", View::Ask));
+    }
+    r
 }
 
 /// A scrolling area whose content sits in a centred column at most 720 points wide.
 fn column(key: &str, content: El, follow_end: bool) -> El {
+    column_of(key, content, follow_end, COLUMN)
+}
+
+/// [`column`] with its own maximum width (Home and the notebook covers are wider, for the grids).
+fn column_of(key: &str, content: El, follow_end: bool, max: f32) -> El {
     let centred = row()
         .w_full()
         .child(el().grow(1.0))
-        .child(content.grow(1000.0).max_w(COLUMN).min_w(0.0))
+        .child(content.grow(1000.0).max_w(max).min_w(0.0))
         .child(el().grow(1.0));
     col().w_full().child(centred).scroll(ScrollSpec { stick_bottom: follow_end }).key(key.to_string()).grow(1.0).min_h(0.0).px(24.0)
 }
@@ -1190,21 +1771,13 @@ fn pieces(summary: &str) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut md = String::new();
     for (n, raw) in summary.lines().enumerate() {
-        let l = raw.trim_start();
-        let task = l.strip_prefix("- [ ] ").map(|t| (false, t)).or_else(|| {
-            l.strip_prefix("- [x] ").or_else(|| l.strip_prefix("- [X] ")).map(|t| (true, t))
-        });
-        match task {
-            Some((done, t)) => {
+        match store::parse_task(raw) {
+            Some((done, text, due)) => {
                 if !md.trim().is_empty() {
                     out.push(Piece::Md(std::mem::take(&mut md)));
                 }
                 md.clear();
-                let (text, due) = match t.rsplit_once(" · ") {
-                    Some((head, due)) if due.chars().count() <= 14 && !due.trim().is_empty() => (head.to_string(), Some(due.trim().to_string())),
-                    _ => (t.to_string(), None),
-                };
-                out.push(Piece::Task { line: n, done, text: text.replace('`', ""), due });
+                out.push(Piece::Task { line: n, done, text, due });
             }
             None => {
                 md.push_str(raw);
@@ -1242,7 +1815,9 @@ fn task_row(i: usize, line: usize, done: bool, label: &str, due: Option<&str>) -
         .size(17.0, 17.0)
         .radius(4.0)
         .fill(if done { P::accent() } else { P::clear() })
-        .border(if done { 0.0 } else { 1.5 }, P::secondary());
+        .border(if done { 0.0 } else { 1.5 }, P::secondary())
+        .center()
+        .children(done.then(|| icon(&CHECK, 13.0).color(hex("#FFFFFF"))));
     let mut r = row()
         .key(format!("task-{line}"))
         .w_full()
@@ -1267,10 +1842,10 @@ fn summary_view(s: &Ui, i: usize, m: &Meeting) -> El {
     if m.summary.trim().is_empty() && !running {
         let how = match s.config.summaries {
             Summaries::Local => format!(
-                "Hushnote writes it with a local LLM ({} at {}) when the meeting ends. Nothing leaves this machine.",
+                "Hushnote writes it with a local LLM ({} at {}) when the session ends. Nothing leaves this machine.",
                 s.config.llm_model, s.config.llm_url
             ),
-            p => format!("Hushnote writes it with {} when the meeting ends. {}", p.label(), p.note()),
+            p => format!("Hushnote writes it with {} when the session ends. {}", p.label(), p.note()),
         };
         c = c
             .child(text("No summary yet").font(sans(17.0, 600.0)).color(P::text()))
@@ -1278,7 +1853,14 @@ fn summary_view(s: &Ui, i: usize, m: &Meeting) -> El {
         if s.summaries_need_setup() {
             c = c.child(llm_row(s));
         } else if !m.lines.is_empty() || !m.notes.trim().is_empty() {
-            c = c.child(row().pt(6.0).child(action_button("summarize", "Write summary", el(), |s: &mut Ui| s.summarize())));
+            let mut buttons = row().pt(6.0).gap(10.0).child(action_button("summarize", "Write summary", el(), |s: &mut Ui| s.summarize()));
+            if m.mode == Mode::Class && !m.lines.is_empty() {
+                buttons = buttons.child(review_button(s, m));
+            }
+            c = c.child(buttons);
+            if m.mode == Mode::Class && !m.lines.is_empty() {
+                c = c.children(review_note(s));
+            }
         }
         return column("summary", c, false);
     }
@@ -1292,25 +1874,251 @@ fn summary_view(s: &Ui, i: usize, m: &Meeting) -> El {
     if running {
         c = c.child(row().gap(8.0).center_y().child(dot(P::accent())).child(text("Writing the summary…").font(sans(13.5, 400.0)).color(P::secondary())));
     } else {
-        c = c.child(summary_actions(m));
+        c = c.child(summary_actions(s, m));
     }
     column("summary", c, running)
 }
 
 /// Rewrite the summary, and where it is saved, with a button to open the file.
-fn summary_actions(m: &Meeting) -> El {
+fn summary_actions(s: &Ui, m: &Meeting) -> El {
     let name = m.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let file = m.file.clone();
-    row()
+    let mut r = row()
         .key("summary-actions")
         .w_full()
         .pt(10.0)
         .gap(10.0)
         .center_y()
-        .child(action_button("resummarize", "Rewrite summary", el(), |s: &mut Ui| s.summarize()))
+        .child(action_button("resummarize", "Rewrite summary", el(), |s: &mut Ui| s.summarize()));
+    if m.mode == Mode::Class {
+        r = r.child(review_button(s, m));
+    }
+    let r = r
         .child(el().grow(1.0))
         .child(text(name).font(mono(12.5)).color(P::dim()).truncate().min_w(0.0).shrink())
-        .child(chip_button("open-file", "Open file".into(), false, move |s: &mut Ui| s.open_file(&file)))
+        .child(chip_button("open-file", "Open file".into(), false, move |s: &mut Ui| s.open_file(&file)));
+    let mut c = col().w_full().gap(8.0).child(r).child(export_row(s, m, true));
+    if m.mode == Mode::Class {
+        c = c.children(review_note(s));
+    }
+    c
+}
+
+/// Export chips, and "Open folder" right after an export. `markdown` is off on the review
+/// screen, which only offers the cards.
+fn export_row(s: &Ui, m: &Meeting, markdown: bool) -> El {
+    let mut r = row().key("export-row").w_full().gap(6.0).center_y().pl(-8.0);
+    if markdown {
+        r = r.child(chip_button("export-markdown", "Export Markdown".into(), false, |s: &mut Ui| s.export(false)).help("A clean study document: summary and review questions, without the transcript."));
+    }
+    if !m.review.is_empty() {
+        r = r.child(chip_button("export-anki", "Export Anki CSV".into(), false, |s: &mut Ui| s.export(true)).help("Cards as front,back, ready for Anki's File > Import."));
+    }
+    if let (Some((msg, dir)), Some((now, _))) = (&s.exported, &s.status) {
+        if msg == now {
+            let dir = dir.clone();
+            r = r.child(chip_button("open-exports", "Open folder".into(), false, move |s: &mut Ui| s.open_file(&dir)));
+        }
+    }
+    r
+}
+
+// ---- View: review -------------------------------------------------------------------------------
+
+fn review_button(s: &Ui, m: &Meeting) -> El {
+    let label = if m.review.is_empty() { "Generate review" } else { "Regenerate review" };
+    let key = if m.review.is_empty() { "generate-review" } else { "regenerate-review" };
+    if s.reviewing.is_some() {
+        return text("Writing review questions…").font(sans(13.5, 400.0)).color(P::secondary());
+    }
+    action_button(key, label, el(), |s: &mut Ui| s.generate_review())
+}
+
+/// A small tip when the local model writes the summary: a long class loses detail with it.
+fn review_note(s: &Ui) -> Option<El> {
+    (s.config.summaries == Summaries::Local).then(|| {
+        row()
+            .key("review-note")
+            .w_full()
+            .gap(2.0)
+            .center_y()
+            .child(text("For quality review questions, use Claude or Codex:").font(sans(13.0, 400.0)).color(P::dim()).shrink().min_w(0.0))
+            .child(chip_button("summaries", summaries_label(s), true, |s: &mut Ui| s.cycle_summaries()).help(s.config.summaries.note().to_string()))
+    })
+}
+
+// ---- View: ask ------------------------------------------------------------------------------
+
+/// A tip when the local model answers: it sees less of a long class.
+fn ask_note(s: &Ui) -> Option<El> {
+    (s.config.summaries == Summaries::Local).then(|| {
+        text("For better answers, pick Claude or Codex with the summary chip below.").font(sans(13.0, 400.0)).color(P::dim()).wrap()
+    })
+}
+
+fn turn_view(key: &str, question: &str, scope: &str, answer: El) -> El {
+    let mut asked = col().max_w(540.0).shrink().min_w(0.0).px(18.0).py(11.0).radius(12.0).fill(P::raised()).gap(4.0);
+    if !scope.is_empty() {
+        asked = asked.child(text(format!("All {scope} classes")).font(sans(12.0, 450.0)).color(P::secondary()));
+    }
+    asked = asked.child(text(question.to_string()).font(sans(15.0, 400.0)).color(P::text()).wrap());
+    col()
+        .key(key.to_string())
+        .w_full()
+        .gap(14.0)
+        .child(row().w_full().child(el().grow(1.0)).child(asked))
+        .child(answer)
+}
+
+fn ask_view(s: &Ui, m: &Meeting) -> El {
+    let style = markdown_style();
+    let thing = if m.mode == Mode::Class { "class" } else { "meeting" };
+    let live = s.asking.as_ref().filter(|a| a.file == m.file);
+    let mut c = col().w_full().gap(26.0).pt(8.0).pb(24.0);
+    if m.questions.is_empty() && live.is_none() {
+        c = c.child(
+            col()
+                .gap(6.0)
+                .child(text("Ask your notes").font(sans(17.0, 600.0)).color(P::text()))
+                .child(
+                    text(format!("Ask about this {thing}. Answers come only from its summary, your notes and the transcript."))
+                        .font(sans(15.0, 400.0))
+                        .color(P::secondary())
+                        .wrap(),
+                )
+                .children(ask_note(s)),
+        );
+    }
+    for (n, t) in m.questions.iter().enumerate() {
+        c = c.child(turn_view(&format!("turn-{n}"), &t.question, &t.scope, Markdown::new(t.answer.clone()).render(&style).key(format!("answer-{n}"))));
+    }
+    if let Some(a) = live {
+        let answer = if a.partial.trim().is_empty() {
+            row().gap(8.0).center_y().child(dot(P::accent())).child(text("Thinking…").font(sans(13.5, 400.0)).color(P::secondary()))
+        } else {
+            row().w_full().child(Markdown::new(a.partial.clone()).render(&style).key("answer-live"))
+        };
+        c = c.child(turn_view("turn-live", &a.question, &a.scope, answer));
+    } else if !m.questions.is_empty() {
+        c = c.children(ask_note(s));
+    }
+    let composer = row().w_full().px(24.0).pb(6.0).child(el().grow(1.0)).child(ask_composer(s, m).grow(1000.0).max_w(COLUMN).min_w(0.0)).child(el().grow(1.0));
+    col().w_full().grow(1.0).min_h(0.0).child(column("ask", c, true)).child(composer)
+}
+
+fn ask_composer(s: &Ui, m: &Meeting) -> El {
+    let thing = if m.mode == Mode::Class { "class" } else { "meeting" };
+    let busy = s.asking.is_some();
+    let field = text_input(&s.ask_input, sans(15.0, 400.0).lh(24.0))
+        .key("ask-input")
+        .w_full()
+        .color(P::text())
+        .placeholder(format!("Ask about this {thing}…"), P::dim())
+        .caret(P::accent(), Color { a: 0.35, ..P::accent() })
+        .on_edit(|s: &mut Ui| &mut s.ask_input)
+        .on_input_key(|s: &mut Ui, ev: &rune::KeyEvent, _: &mut Tx| {
+            if matches!(ev.key, rune::Key::Enter) && !ev.mods.shift {
+                s.ask();
+                return true;
+            }
+            false
+        });
+    let input = col().key("ask-scroll").w_full().min_h(40.0).max_h(150.0).shrink().scroll(ScrollSpec { stick_bottom: false }).child(field);
+    let mut bar = row().w_full().gap(6.0).center_y();
+    if let Some((subject, _)) = s.ask_subject() {
+        let label = if s.ask_all { format!("All {subject} classes") } else { format!("This {thing}") };
+        bar = bar.child(
+            chip_button("ask-scope", label, true, |s: &mut Ui| s.ask_all = !s.ask_all)
+                .help("Switch between this session and the summaries of every class in the subject."),
+        );
+    } else {
+        bar = bar.child(text(format!("This {thing}")).font(sans(14.0, 400.0)).color(P::secondary()).px(8.0));
+    }
+    bar = bar.child(chip_button("summaries", summaries_label(s), true, |s: &mut Ui| s.cycle_summaries()).help(s.config.summaries.note().to_string()));
+    if !m.questions.is_empty() && !busy {
+        bar = bar.child(chip_button("ask-clear", "Clear".into(), false, |s: &mut Ui| s.clear_questions()).help("Delete the questions and answers saved in this session."));
+    }
+    bar = bar.child(el().grow(1.0));
+    bar = bar.child(if busy {
+        text("Thinking…").font(sans(13.5, 400.0)).color(P::secondary())
+    } else {
+        action_button("ask-send", "Ask", el(), |s: &mut Ui| s.ask())
+    });
+    col()
+        .key("ask-composer")
+        .w_full()
+        .pt(12.0)
+        .pb(10.0)
+        .px(16.0)
+        .gap(8.0)
+        .radius(12.0)
+        .fill(P::raised())
+        .border(1.0, P::line())
+        .child(input.pl(2.0))
+        .child(bar.pl(-6.0))
+}
+
+fn review_view(s: &Ui, m: &Meeting) -> El {
+    let mut c = col().w_full().gap(16.0).pt(6.0).pb(28.0);
+    if s.reviewing.as_deref() == Some(m.file.as_path()) {
+        c = c.child(row().gap(8.0).center_y().child(dot(P::accent())).child(text("Writing review questions…").font(sans(13.5, 400.0)).color(P::secondary())));
+        return column("review", c, false);
+    }
+    let Some(card) = m.review.get(s.card) else {
+        c = c
+            .child(text("No review questions yet").font(sans(17.0, 600.0)).color(P::text()))
+            .child(text("Hushnote writes 5 to 10 questions with answers from this class's summary.").font(sans(15.0, 400.0)).color(P::secondary()).wrap());
+        if !m.summary.trim().is_empty() || !m.lines.is_empty() {
+            c = c.child(row().pt(6.0).child(review_button(s, m)));
+        }
+        return column("review", c.children(review_note(s)), false);
+    };
+    c = c.child(flashcard(card, s.card, m.review.len(), s.revealed, None)).child(row().pt(10.0).child(review_button(s, m))).child(export_row(s, m, false));
+    column("review", c.children(review_note(s)), false)
+}
+
+/// One flashcard with its Previous / Next / Show answer controls, shared by a class's review
+/// and by "Review all" on a notebook (which names the class each card comes from in `source`).
+/// `at` is the card on screen out of `len`; the click handlers act on `Ui::card` and
+/// `Ui::revealed`.
+fn flashcard(card: &Card, at: usize, len: usize, revealed: bool, source: Option<&str>) -> El {
+    let label = |t: &str| text(t.to_string()).font(mono(12.0)).color(P::dim());
+    let mut face = col()
+        .key("review-card")
+        .w_full()
+        .min_h(120.0)
+        .gap(12.0)
+        .px(28.0)
+        .py(26.0)
+        .radius(14.0)
+        .fill(P::raised())
+        .border(1.0, P::line())
+        .role("button")
+        .label(if revealed { "Hide the answer" } else { "Show the answer" })
+        .on_press(|s: &mut Ui| s.revealed = !s.revealed);
+    if let Some(from) = source {
+        face = face.child(text(from.to_string()).font(sans(13.0, 500.0)).color(P::secondary()).truncate().min_w(0.0));
+    }
+    face = face.child(label("QUESTION")).child(text(card.question.clone()).font(sans(19.0, 600.0)).color(P::text()).wrap().w_full());
+    face = if revealed {
+        face.child(el().w_full().h(1.0).fill(P::line()))
+            .child(label("ANSWER"))
+            .child(Markdown::new(card.answer.clone()).render(&markdown_style()).key("review-answer"))
+    } else {
+        face.child(text("Click to show the answer").font(sans(13.5, 400.0)).color(P::dim()))
+    };
+    let counter = text(format!("{} / {}", at + 1, len)).font(mono(13.0)).color(P::secondary());
+    let controls = row()
+        .key("review-controls")
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .child(action_button("review-prev", "Previous", el(), |s: &mut Ui| s.step_card(-1)))
+        .child(action_button("review-next", "Next", el(), |s: &mut Ui| s.step_card(1)))
+        .child(counter)
+        .child(el().grow(1.0))
+        .child(action_button("review-reveal", if revealed { "Hide answer" } else { "Show answer" }, el(), |s: &mut Ui| s.revealed = !s.revealed));
+    col().w_full().gap(16.0).child(face).child(controls)
 }
 
 // ---- View: home and footer -------------------------------------------------------------------
@@ -1343,28 +2151,30 @@ fn home_view(s: &Ui) -> El {
             .child(text(value).font(mono(18.0)).color(P::text()))
             .child(text(label.to_string()).font(sans(13.0, 400.0)).color(P::secondary()))
     };
-    let c = col()
-        .w_full()
-        .gap(18.0)
-        .pt(64.0)
-        .child(wordmark(0.62))
-        .child(
-            text("Meeting notes that never leave your machine. Transcribed live with Parakeet, summarized by a local LLM, saved as Markdown.")
-                .font(sans(15.0, 400.0))
-                .color(P::secondary())
-                .wrap(),
-        )
-        .child(
-            row()
-                .pt(8.0)
-                .gap(36.0)
-                .child(stat("meetings", s.meetings.len().to_string()))
-                .child(stat("recorded", minutes(total_ms)))
-                .child(stat("open action items", open_tasks.to_string())),
-        )
-        .child(row().pt(10.0).child(action_button("home-new", "New meeting", dot(P::rec()).size(9.0, 9.0).radius(4.5), |s: &mut Ui| s.new_meeting())));
-    let c = if !s.speech_ready() || s.summaries_need_setup() || s.download.is_some() {
-        c.child(
+    let stats = row()
+        .gap(36.0)
+        .child(stat("sessions", s.meetings.len().to_string()))
+        .child(stat("recorded", minutes(total_ms)))
+        .child(stat("open action items", open_tasks.to_string()));
+    let start = row()
+        .gap(8.0)
+        .center_y()
+        .child(action_button("home-new", "New session", dot(P::rec()).size(9.0, 9.0).radius(4.5), |s: &mut Ui| s.new_meeting()))
+        .child(chip_button("home-mode", format!("Mode · {}", s.new_mode.label()), true, |s: &mut Ui| s.new_mode = s.new_mode.next()));
+    let intro = text("Meeting notes that never leave your machine. Transcribed live with Parakeet, summarized by a local LLM, saved as Markdown.")
+        .font(sans(15.0, 400.0))
+        .color(P::secondary())
+        .wrap()
+        .max_w(560.0);
+    let books = !s.meetings.is_empty();
+    let mut c = col().w_full().gap(18.0).pt(if books { 40.0 } else { 64.0 }).pb(28.0).child(wordmark(if books { 0.5 } else { 0.62 })).child(intro);
+    c = if books {
+        c.child(row().w_full().pt(4.0).gap(24.0).center_y().child(stats).child(el().grow(1.0)).child(start))
+    } else {
+        c.child(stats.pt(8.0)).child(start.pt(10.0))
+    };
+    if !s.speech_ready() || s.summaries_need_setup() || s.download.is_some() {
+        c = c.child(
             col()
                 .key("setup")
                 .w_full()
@@ -1373,11 +2183,279 @@ fn home_view(s: &Ui) -> El {
                 .child(text("SET UP").font(mono(11.5)).color(P::dim()).pb(2.0))
                 .child(speech_row(s))
                 .child(llm_row(s)),
+        );
+    }
+    if books {
+        let mut grid = row().key("notebook-grid").w_full().gaps(28.0, CARD_GAP).flex_wrap();
+        for g in store::notebooks(&s.meetings) {
+            grid = grid.child(folder_card(s, &g));
+        }
+        c = c.child(col().w_full().pt(22.0).gap(16.0).child(text("NOTEBOOKS").font(mono(11.5)).color(P::dim())).child(grid));
+    }
+    column_of("home", c, false, if books { COLUMN_WIDE } else { COLUMN })
+}
+
+// ---- Folders and sheets -----------------------------------------------------------------------------
+
+/// How a sheet of paper looks: `depth` 0 is the one in front; the ones behind it are a shade darker.
+struct Paper {
+    bg: Color,
+    title: Color,
+    body: Color,
+    faint: Color,
+}
+
+fn paper(depth: usize) -> Paper {
+    let bg = ["#ECEAE4", "#DEDCD6", "#D0CEC8"][depth.min(2)];
+    Paper { bg: hex(bg), title: hex("#171718"), body: hex("#64635E"), faint: hex("#8A8984") }
+}
+
+/// What a session says on a sheet: title (bold, two lines at most) and the preview lines.
+fn sheet_text(m: &Meeting, look: &Paper, big: bool, lines: usize) -> El {
+    let (title_font, body_font) = if big { (sans(14.5, 650.0).lh(19.0), sans(11.5, 400.0).lh(15.0)) } else { (sans(12.5, 650.0).lh(16.0), sans(9.5, 400.0).lh(12.5)) };
+    let mut c = col().w_full().min_h(0.0).gap(if big { 3.0 } else { 2.0 });
+    c = c.child(text(m.title.clone()).font(title_font).color(look.title).max_lines(2).w_full());
+    let mut body = col().w_full().gap(if big { 3.0 } else { 2.0 }).pt(if big { 5.0 } else { 3.0 });
+    for l in store::preview_lines(m, lines) {
+        body = body.child(text(l).font(body_font).color(look.body).truncate().min_w(0.0).w_full());
+    }
+    c.child(body)
+}
+
+/// The card of a notebook on Home: a folder with its newest sessions' sheets sticking out of
+/// it. Everything is absolutely placed inside one fixed box, in paint order (the folder's back
+/// and tab, the sheets from the oldest to the newest, then the front of the folder over their
+/// lower half). Sheets behind the first are nudged and tilted a few degrees (`rotate`).
+fn folder_card(s: &Ui, g: &store::Group) -> El {
+    let (w, h) = (CARD_W, CARD_H);
+    let (back, front, edge) = (hex("#222226"), hex("#2A2A2E"), hex("#38383E"));
+    let key = g.key.clone();
+    let summary = store::group_summary(&s.meetings, g);
+    let mut card = el()
+        .key(format!("folder-{}", g.key))
+        .w(w)
+        .h(h)
+        .hover_group()
+        .role("button")
+        .label(format!("{}, {}", g.title, summary))
+        .on_press(move |s: &mut Ui| s.open_notebook(&key))
+        .child(el().absolute(0.0, 0.0).size(92.0, 34.0).radius(11.0).fill(back))
+        .child(el().absolute(0.0, 16.0).size(w, h - 16.0).radius(13.0).fill(back));
+    // (x, y, width, tilt in radians) of the newest sheet and of the two behind it.
+    let spots = [(16.0, 32.0, w - 32.0, 0.0), (12.0, 28.0, w - 24.0, 0.05), (20.0, 26.0, w - 40.0, -0.045)];
+    let recent = store::most_recent(&s.meetings, &g.indices, 3);
+    for (rank, &i) in recent.iter().enumerate().rev() {
+        let (x, y, sw, tilt) = spots[rank];
+        let look = paper(rank);
+        card = card.child(
+            el()
+                .absolute(x, y)
+                .size(sw, 120.0)
+                .radius(7.0)
+                .fill(look.bg)
+                .rotate(tilt)
+                .clip_rounded(7.0)
+                .child(if rank == 0 { sheet_text(&s.meetings[i], &look, false, 3).px(11.0).pt(11.0) } else { el() }),
+        );
+    }
+    card = card
+        .child(
+            col()
+                .absolute(0.0, 100.0)
+                .size(w, h - 100.0)
+                .radius(13.0)
+                .fill(front)
+                .border(1.0, edge)
+                .px(16.0)
+                .pt(14.0)
+                .gap(3.0)
+                .child(text(g.title.clone()).font(sans(14.5, 600.0)).color(P::text()).truncate().min_w(0.0).w_full())
+                .child(text(summary).font(sans(12.5, 400.0)).color(P::secondary()).truncate().min_w(0.0).w_full()),
         )
+        .child(el().absolute(0.0, 0.0).size(w, h).radius(13.0).border(1.5, Color { a: 0.55, ..P::accent() }).group_opacity(0.0, 1.0));
+    card
+}
+
+/// A session as a page of the notebook: title, date, a short preview and what it has (flashcards,
+/// questions). Pressing it opens the session.
+fn session_sheet(s: &Ui, i: usize) -> El {
+    let m = &s.meetings[i];
+    let look = paper(0);
+    let mut have = Vec::new();
+    if !m.review.is_empty() {
+        have.push(format!("{} flashcard{}", m.review.len(), if m.review.len() == 1 { "" } else { "s" }));
+    }
+    if !m.questions.is_empty() {
+        have.push(format!("{} question{}", m.questions.len(), if m.questions.len() == 1 { "" } else { "s" }));
+    }
+    col()
+        .key(format!("sheet-{i}"))
+        .w(SHEET_W)
+        .h(SHEET_H)
+        .px(14.0)
+        .pt(14.0)
+        .pb(12.0)
+        .gap(4.0)
+        .radius(8.0)
+        .fill(look.bg)
+        .hover(Color { a: 0.07, ..hex("#000000") })
+        .shadow(2.0, 10.0, Color { a: 0.35, ..hex("#000000") })
+        .clip_rounded(8.0)
+        .role("button")
+        .label(m.title.clone())
+        .on_press(move |s: &mut Ui| s.select(i))
+        .child(text(short_date(&m.date)).font(mono(11.0)).color(look.faint))
+        .child(sheet_text(m, &look, true, 5))
+        .child(el().grow(1.0))
+        .child(text(have.join(" · ")).font(sans(11.5, 450.0)).color(look.faint).truncate().min_w(0.0).w_full())
+}
+
+// ---- View: notebook cover ---------------------------------------------------------------------------
+
+/// An [`action_button`] with no mark, so its label sits centred.
+fn plain_button(key: &str, label: &str, on: impl Fn(&mut Ui) + 'static) -> El {
+    row()
+        .key(key.to_string())
+        .h(34.0)
+        .px(14.0)
+        .center_y()
+        .radius(9.0)
+        .fill(P::line())
+        .hover(hex("#323236"))
+        .role("button")
+        .label(label.to_string())
+        .on_press(on)
+        .child(text(label.to_string()).font(sans(14.0, 550.0)).color(P::text()))
+}
+
+fn disabled_button(key: &str, label: &str, tip: &str) -> El {
+    plain_button(key, label, |_: &mut Ui| {}).opacity(0.45).help(tip.to_string())
+}
+
+fn notebook_view(s: &Ui, g: &store::Group) -> El {
+    let order = store::chronological(&s.meetings, &g.indices);
+    let cards: usize = g.indices.iter().map(|&i| s.meetings[i].review.len()).sum();
+    let idle = matches!(s.rec, Rec::Idle);
+    let mut c = col().w_full().gap(26.0).pt(12.0).pb(32.0);
+
+    let mut sub = store::group_summary(&s.meetings, g);
+    if cards > 0 {
+        sub.push_str(&format!(" · {cards} flashcards"));
+    }
+    c = c.child(col().gap(6.0).child(text(g.title.clone()).font(sans(26.0, 650.0)).color(P::text()).truncate().min_w(0.0)).child(text(sub).font(sans(14.0, 400.0)).color(P::secondary())));
+
+    // Actions.
+    let mut actions = row().key("notebook-actions").w_full().gap(10.0).center_y().flex_wrap();
+    let group = g.clone();
+    let new_label = if g.kind == store::GroupKind::Meetings { "New session" } else { "New class" };
+    let mut new = action_button("nb-new", new_label, dot(P::rec()).size(9.0, 9.0).radius(4.5), move |s: &mut Ui| s.new_in(&group));
+    if !idle {
+        new = new.opacity(0.45);
+    }
+    actions = actions.child(new);
+    actions = actions.child(if cards > 0 {
+        plain_button("nb-review", "Review all", |s: &mut Ui| {
+            s.nb_review = true;
+            s.reset_review();
+        })
     } else {
-        c
-    };
-    column("home", c, false)
+        disabled_button("nb-review", "No flashcards yet", "Review questions are generated in each class, from its Review tab.")
+    });
+    let askable = g.indices.iter().any(|&i| !s.meetings[i].summary.trim().is_empty() || !s.meetings[i].lines.is_empty());
+    if g.kind == store::GroupKind::Notebook {
+        actions = actions.child(if askable {
+            plain_button("nb-ask", "Ask this notebook", |s: &mut Ui| s.ask_notebook())
+                .help("Ask a question about all the classes of this notebook.")
+        } else {
+            disabled_button("nb-ask", "Ask this notebook", "Record or write something in a class first.")
+        });
+    }
+    actions = actions.child(plain_button("nb-export", "Export notebook", |s: &mut Ui| s.export_notebook()).help("A Markdown study document and an Anki CSV with every class, in the exports folder."));
+    if let (Some((msg, dir)), Some((now, _))) = (&s.exported, &s.status) {
+        if msg == now {
+            let dir = dir.clone();
+            actions = actions.child(chip_button("open-exports", "Open folder".into(), false, move |s: &mut Ui| s.open_file(&dir)));
+        }
+    }
+    c = c.child(actions);
+
+    // Due soon: open tasks, newest class first.
+    let mut newest = order.clone();
+    newest.reverse();
+    let tasks = store::open_tasks(&s.meetings, &newest);
+    if !tasks.is_empty() {
+        const SHOWN: usize = 6;
+        let mut due = col().key("due-soon").w_full().gap(2.0);
+        for t in tasks.iter().take(SHOWN) {
+            due = due.child(cover_task_row(t, &s.meetings[t.session].title));
+        }
+        if tasks.len() > SHOWN {
+            due = due.child(text(format!("and {} more in the classes", tasks.len() - SHOWN)).font(sans(13.0, 400.0)).color(P::dim()).pt(4.0));
+        }
+        c = c.child(col().w_full().gap(10.0).child(text("DUE SOON").font(mono(11.5)).color(P::dim())).child(due));
+    }
+
+    // The pages, oldest first.
+    let mut sheets = row().key("sheets").w_full().gaps(CARD_GAP, CARD_GAP).flex_wrap();
+    for &i in &order {
+        sheets = sheets.child(session_sheet(s, i));
+    }
+    let label = if g.kind == store::GroupKind::Meetings { "SESSIONS" } else { "CLASSES" };
+    c = c.child(col().w_full().gap(14.0).child(text(label).font(mono(11.5)).color(P::dim())).child(sheets));
+    column_of("notebook", c, false, COLUMN_WIDE)
+}
+
+/// An open task on a cover: a check that ticks it in its class's file, the task, the class it
+/// comes from and its due day.
+fn cover_task_row(t: &store::OpenTask, source: &str) -> El {
+    let (i, line) = (t.session, t.line);
+    let boxed = el().size(17.0, 17.0).radius(4.0).border(1.5, P::secondary());
+    let mut r = row()
+        .key(format!("due-{i}-{line}"))
+        .w_full()
+        .gap(14.0)
+        .center_y()
+        .py(5.0)
+        .role("checkbox")
+        .checked(false)
+        .label(t.text.clone())
+        .on_press(move |s: &mut Ui| s.toggle_task(i, line))
+        .child(boxed)
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(10.0)
+                .center_y()
+                .child(text(t.text.clone()).font(sans(15.0, 400.0)).color(P::text()).truncate().min_w(0.0).shrink())
+                .child(text(source.to_string()).font(sans(13.0, 400.0)).color(P::dim()).truncate().min_w(0.0).shrink()),
+        );
+    if let Some(d) = &t.due {
+        r = r.child(text(d.clone()).font(mono(12.5)).color(P::secondary()));
+    }
+    r
+}
+
+/// "Review all": the flashcards of every class of the notebook, oldest class first, each
+/// naming its class.
+fn notebook_review_view(s: &Ui, g: &store::Group) -> El {
+    let deck = s.deck();
+    let mut c = col().w_full().gap(16.0).pt(6.0).pb(28.0);
+    c = c.child(row().pl(-8.0).child(chip_button("review-back", format!("Back to {}", g.title), false, |s: &mut Ui| {
+        s.nb_review = false;
+        s.reset_review();
+    })));
+    let at = s.card.min(deck.len().saturating_sub(1));
+    match deck.get(at) {
+        Some(&(session, card)) => {
+            let m = &s.meetings[session];
+            c = c.child(flashcard(&m.review[card], at, deck.len(), s.revealed, Some(&m.title)));
+        }
+        None => {
+            c = c.child(text("No flashcards yet").font(sans(17.0, 600.0)).color(P::text()));
+        }
+    }
+    column("notebook-review", c, false)
 }
 
 /// Bytes so far and a thin bar, for a download.
@@ -1505,6 +2583,8 @@ fn footer(s: &Ui, m: Option<&Meeting>) -> El {
             }
             r.child(text(minutes(m.duration_ms)).font(sans(13.5, 400.0)).color(P::secondary()))
         }
+        Some(m) if s.view == View::Ask => row().child(text(format!("{} questions", m.questions.len())).font(sans(13.5, 400.0)).color(P::secondary())),
+        Some(m) if s.view == View::Review => row().child(text(format!("{} questions", m.review.len())).font(sans(13.5, 400.0)).color(P::secondary())),
         Some(m) => row().child(text(format!("{} lines · {}", m.lines.len(), minutes(m.duration_ms))).font(sans(13.5, 400.0)).color(P::secondary())),
         None => row(),
     };
@@ -1599,6 +2679,85 @@ fn demo_meetings() -> Vec<Meeting> {
     ]
 }
 
+/// Sample classes for the class-mode scenes: three of Calculus I and two of Biology 101.
+fn demo_classes() -> Vec<Meeting> {
+    let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("Documents").join("Hushnote");
+    let class = |file: &str, title: &str, subject: &str, date: &str, mins: u64| Meeting {
+        file: dir.join(file),
+        title: title.into(),
+        mode: Mode::Class,
+        subject: subject.into(),
+        date: date.into(),
+        duration_ms: mins * 60_000,
+        summary_by: "Qwen3 4B".into(),
+        ..Default::default()
+    };
+    let card = |q: &str, a: &str| Card { question: q.into(), answer: a.into() };
+    let turn = |q: &str, a: &str, scope: &str| Turn { question: q.into(), answer: a.into(), scope: scope.into() };
+
+    let mut limits = class("2026-11-18-limits-and-continuity.md", "Limits and continuity", "Calculus I", "2026-11-18 09:00", 52);
+    limits.notes = "Midterm covers chapters 1-3\nOffice hours Wednesday 3pm".into();
+    limits.summary = "## Topics covered\n- Limits of a function at a point and at infinity.\n- One-sided limits and when a limit exists.\n- Continuity and the three types of discontinuity.\n\n\
+        ## Key concepts and definitions\n- **Limit**: the value `f(x)` approaches as `x` gets close to `a`.\n- **Continuous at a**: the limit exists, `f(a)` exists and they are equal.\n- **Removable discontinuity**: the limit exists but differs from `f(a)`.\n\n\
+        ## Formulas or examples\n- `lim x->0 sin(x)/x = 1`\n- `lim x->2 (x^2 - 4)/(x - 2) = 4`, after factoring the numerator.\n- Squeeze theorem: if `g(x) <= f(x) <= h(x)` and both bounds share a limit, so does `f`.\n\n\
+        ## Tasks and due dates\n- [ ] Problem set 3, exercises 1-12 · Fri\n- [ ] Read section 2.5 on continuity · Wed\n- [x] Sign up for the midterm review session"
+        .into();
+    limits.review = vec![
+        card("What three conditions make f continuous at a?", "The limit of f(x) as x -> a exists, f(a) is defined, and the two are equal."),
+        card("What is lim x->0 sin(x)/x?", "1. It is proved with the squeeze theorem."),
+        card("When does a two-sided limit exist?", "When both one-sided limits exist and are equal."),
+        card("What is a removable discontinuity?", "A point where the limit exists but is not equal to f(a), or f(a) is undefined."),
+        card("State the squeeze theorem.", "If g(x) <= f(x) <= h(x) near a and g and h tend to L, then f tends to L."),
+        card("Evaluate lim x->2 (x^2 - 4)/(x - 2).", "Factor to (x + 2)(x - 2)/(x - 2) = x + 2, so the limit is 4."),
+        card("Name the three types of discontinuity.", "Removable, jump and infinite."),
+    ];
+    limits.questions = vec![
+        turn(
+            "Why is sin(x)/x not defined at 0 but still has a limit?",
+            "The function is undefined at `x = 0` because the denominator is zero, but a limit only looks at values near the point. As `x` gets close to 0 from either side, `sin(x)/x` gets close to 1, so the limit exists and the discontinuity is removable.",
+            "",
+        ),
+        turn(
+            "What did the professor say about the midterm?",
+            "The midterm covers chapters 1 to 3. Office hours are on Wednesday at 3pm, and problem set 3 is due on Friday.",
+            "",
+        ),
+    ];
+    limits.lines = vec![Line { speaker: Speaker::Them, t_ms: 61_000, text: "Today we start with limits, and then we talk about continuity.".into() }];
+
+    let mut derivs = class("2026-11-20-derivatives.md", "Derivatives and the power rule", "Calculus I", "2026-11-20 09:00", 55);
+    derivs.summary = "## Topics covered\n- The derivative as a limit of difference quotients.\n- Power, sum and constant multiple rules.\n- Tangent lines.\n\n\
+        ## Key concepts and definitions\n- **Derivative**: the instantaneous rate of change, or the slope of the tangent line.\n- **Differentiable** implies continuous, but not the other way around.\n\n\
+        ## Formulas or examples\n- `f'(x) = lim h->0 (f(x+h) - f(x))/h`\n- `d/dx x^n = n x^(n-1)`\n- `d/dx (3x^4 - 2x) = 12x^3 - 2`\n\n\
+        ## Tasks and due dates\n- [ ] Problem set 4, exercises 1-10 · Fri\n- [ ] Quiz on limits · Tue"
+        .into();
+    derivs.review = vec![
+        card("Define the derivative using a limit.", "f'(x) = lim h->0 (f(x+h) - f(x))/h"),
+        card("What is the power rule?", "d/dx x^n = n x^(n-1)"),
+    ];
+
+    let mut chain = class("2026-11-21-the-chain-rule.md", "The chain rule", "Calculus I", "2026-11-21 14:00", 48);
+    chain.summary = "## Topics covered\n- Differentiating composite functions.\n- Product and quotient rules, with examples.\n\n\
+        ## Key concepts and definitions\n- **Composite function**: a function applied to the result of another, `f(g(x))`.\n\n\
+        ## Formulas or examples\n- `d/dx f(g(x)) = f'(g(x)) * g'(x)`\n- `d/dx sin(x^2) = 2x cos(x^2)`\n\n\
+        ## Tasks and due dates\n- [ ] Practice exam, chain rule section · Mon"
+        .into();
+
+    let mut bio = class("2026-11-19-cell-respiration.md", "Cellular respiration", "Biology 101", "2026-11-19 11:00", 50);
+    bio.summary = "## Topics covered\n- Glycolysis, the Krebs cycle and the electron transport chain.\n\n\
+        ## Key concepts and definitions\n- **ATP**: the cell's energy currency.\n\n\
+        ## Formulas or examples\n- `C6H12O6 + 6 O2 -> 6 CO2 + 6 H2O + ATP`\n\n\
+        ## Tasks and due dates\n- [ ] Lab report 2 · Thu"
+        .into();
+    let mut photo = class("2026-11-12-photosynthesis.md", "Photosynthesis", "biology 101", "2026-11-12 11:00", 46);
+    photo.summary = "## Topics covered\n- Light reactions and the Calvin cycle.\n\n\
+        ## Key concepts and definitions\n- **Chlorophyll**: the pigment that absorbs light in the chloroplast.\n\n\
+        ## Formulas or examples\n- `6 CO2 + 6 H2O + light -> C6H12O6 + 6 O2`\n\n\
+        ## Tasks and due dates\n- [x] Lab report 1"
+        .into();
+    vec![limits, derivs, chain, bio, photo]
+}
+
 fn scene_demo(s: &mut Ui) {
     s.demo = true;
     s.speech_ready_override = Some(true);
@@ -1608,6 +2767,7 @@ fn scene_demo(s: &mut Ui) {
     s.meetings = demo_meetings();
     s.selected = Some(0);
     s.notes = TextEdit::new(s.meetings[0].notes.clone());
+    s.subject = TextEdit::new(s.meetings[0].subject.clone());
     s.view = View::Summary;
     s.status = None;
     s.unseen.insert(s.meetings[2].file.clone());
@@ -1631,9 +2791,60 @@ fn scene_recording(s: &mut Ui) {
     set_meter(&s.meters.them, 0.85);
 }
 
+/// The first Calculus I class of the demo data, open on its summary.
+fn scene_class(s: &mut Ui) {
+    scene_demo(s);
+    s.meetings.extend(demo_classes());
+    let i = s.meetings.iter().position(|m| m.title == "Limits and continuity").unwrap_or(0);
+    s.selected = Some(i);
+    s.notes = TextEdit::new(s.meetings[i].notes.clone());
+    s.subject = TextEdit::new(s.meetings[i].subject.clone());
+    s.new_mode = Mode::Class;
+    s.view = View::Summary;
+}
+
+fn scene_review(s: &mut Ui) {
+    scene_class(s);
+    s.view = View::Review;
+    s.card = 2;
+    s.revealed = false;
+}
+
+fn scene_review_revealed(s: &mut Ui) {
+    scene_review(s);
+    s.revealed = true;
+}
+
+fn scene_ask(s: &mut Ui) {
+    scene_class(s);
+    s.view = View::Ask;
+}
+
+/// The notebooks sidebar: Calculus I open with a class selected, Biology 101 closed, Meetings open.
+fn scene_notebooks(s: &mut Ui) {
+    scene_class(s);
+    s.closed.insert(store::subject_key("Biology 101"));
+}
+
+/// Home with the notebooks grid: the demo meetings and classes, nothing open.
 fn scene_home(s: &mut Ui) {
     scene_demo(s);
+    s.meetings.extend(demo_classes());
     s.selected = None;
+}
+
+/// The cover of Calculus I.
+fn scene_notebook(s: &mut Ui) {
+    scene_home(s);
+    s.new_mode = Mode::Class;
+    s.notebook = Some(store::subject_key("Calculus I"));
+}
+
+/// "Review all" on the cover of Calculus I, on its fourth card with the answer hidden.
+fn scene_notebook_review(s: &mut Ui) {
+    scene_notebook(s);
+    s.nb_review = true;
+    s.card = 3;
 }
 
 /// First run: nothing downloaded yet, the speech model on its way.
@@ -1668,6 +2879,13 @@ pub fn run(args: Vec<String>) {
             ("transcript", scene_transcript),
             ("recording", scene_recording),
             ("home", scene_home),
+            ("class", scene_class),
+            ("review", scene_review),
+            ("review-revealed", scene_review_revealed),
+            ("ask", scene_ask),
+            ("notebooks", scene_notebooks),
+            ("notebook", scene_notebook),
+            ("notebook-review", scene_notebook_review),
             ("empty", scene_empty),
             ("setup", scene_setup),
         ],
@@ -1690,6 +2908,198 @@ mod tests {
         assert!(matches!(&p[1], Piece::Task { line: 4, done: false, text, due: Some(d) } if text == "Dani fixes the bug" && d == "Thu"));
         assert!(matches!(&p[2], Piece::Task { done: true, due: None, .. }));
         assert!(matches!(&p[3], Piece::Md(s) if s.contains("Open questions")));
+    }
+
+    #[test]
+    fn stepping_through_cards_stops_at_the_ends() {
+        assert_eq!(step(0, 8, -1), 0);
+        assert_eq!(step(0, 8, 1), 1);
+        assert_eq!(step(7, 8, 1), 7);
+        assert_eq!(step(7, 8, -1), 6);
+        assert_eq!(step(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn changing_card_hides_the_answer() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        ui.selected = Some(0);
+        ui.meetings[0].review = (1..=3).map(|i| Card { question: format!("q{i}"), answer: format!("a{i}") }).collect();
+        ui.revealed = true;
+        ui.step_card(1);
+        assert_eq!((ui.card, ui.revealed), (1, false));
+        ui.revealed = true;
+        ui.step_card(-1);
+        ui.revealed = true;
+        ui.step_card(-1); // already at the first card: stays put, and the answer stays up
+        assert_eq!((ui.card, ui.revealed), (0, true));
+        ui.step_card(1);
+        ui.step_card(1);
+        assert_eq!(ui.card, 2);
+        ui.select(1);
+        assert_eq!((ui.card, ui.revealed), (0, false));
+    }
+
+    #[test]
+    fn asking_needs_a_subject_shared_by_two_sessions() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        ui.selected = Some(0);
+        assert!(ui.ask_subject().is_none(), "no subject");
+        ui.meetings[0].subject = "Calculus I".into();
+        assert!(ui.ask_subject().is_none(), "alone in its subject");
+        ui.meetings[1].subject = " calculus  i".into();
+        let (name, all) = ui.ask_subject().unwrap();
+        assert_eq!((name.as_str(), all.len()), ("Calculus I", 2));
+    }
+
+    #[test]
+    fn answers_are_kept_and_a_failed_question_goes_back_in_the_box() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        ui.selected = Some(0);
+        let file = ui.meetings[0].file.clone();
+        let asking = |q: &str| Asking { file: file.clone(), question: q.into(), scope: String::new(), partial: String::new() };
+        ui.asking = Some(asking("When is the beta?"));
+        ui.llm.0.send(LlmMsg::AskDelta(file.clone(), "On ".into())).unwrap();
+        ui.llm.0.send(LlmMsg::Asked(file.clone(), Ok("On Friday.".into()))).unwrap();
+        ui.drain();
+        assert!(ui.asking.is_none());
+        assert_eq!(ui.meetings[0].questions.len(), 1);
+        assert_eq!(ui.meetings[0].questions[0].answer, "On Friday.");
+        ui.asking = Some(asking("Who owns pricing?"));
+        ui.llm.0.send(LlmMsg::Asked(file, Err("model offline".into()))).unwrap();
+        ui.drain();
+        assert_eq!(ui.meetings[0].questions.len(), 1, "the history is kept");
+        assert_eq!(ui.ask_input.text, "Who owns pricing?");
+        assert!(ui.status.as_ref().unwrap().1);
+        ui.clear_questions();
+        assert!(ui.meetings[0].questions.is_empty());
+    }
+
+    #[test]
+    fn demo_classes_group_into_notebooks_after_the_meetings_are_added() {
+        let mut all = demo_meetings();
+        all.extend(demo_classes());
+        let groups = store::notebooks(&all);
+        let names: Vec<_> = groups.iter().map(|g| (g.title.as_str(), g.indices.len())).collect();
+        assert_eq!(names, [("Calculus I", 3), ("Biology 101", 2), ("Meetings", 6)]);
+    }
+
+    #[test]
+    fn a_notebook_cover_opens_reviews_all_cards_and_asks_the_subject() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        ui.meetings.extend(demo_classes());
+        ui.selected = Some(0);
+        ui.open_notebook(&store::subject_key("Calculus I"));
+        assert!(ui.selected.is_none() && ui.cover().is_some_and(|g| g.title == "Calculus I"));
+        let deck = ui.deck();
+        assert_eq!(deck.len(), 9, "7 + 2 flashcards");
+        // Oldest class first: Limits (18 Nov) before Derivatives (20 Nov).
+        assert_eq!(ui.meetings[deck[0].0].title, "Limits and continuity");
+        assert_eq!(ui.meetings[deck[8].0].title, "Derivatives and the power rule");
+        ui.nb_review = true;
+        ui.revealed = true;
+        ui.step_card(1);
+        assert_eq!((ui.card, ui.revealed), (1, false));
+        for _ in 0..20 {
+            ui.step_card(1);
+        }
+        assert_eq!(ui.card, 8, "stops at the last card of the whole deck");
+        ui.nb_review = false;
+        ui.ask_notebook();
+        let m = ui.current().unwrap();
+        assert_eq!(m.title, "The chain rule", "the newest session of the notebook");
+        assert!(ui.view == View::Ask && ui.ask_all && ui.notebook.is_none());
+        ui.go_home();
+        assert!(ui.notebook.is_none() && ui.selected.is_none());
+    }
+
+    #[test]
+    fn exporting_a_notebook_in_demo_mode_writes_nothing() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_classes();
+        ui.open_notebook(&store::subject_key("Calculus I"));
+        ui.export_notebook();
+        assert!(ui.exported.is_none() && ui.status.as_ref().is_some_and(|s| s.1));
+    }
+
+    #[test]
+    fn an_empty_notebook_name_keeps_the_box_open() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.notebook_input = Some(TextEdit::new("   "));
+        ui.confirm_notebook();
+        assert!(ui.notebook_input.is_some(), "nothing was created and the box stays");
+    }
+
+    #[test]
+    fn search_finds_sessions_by_subject() {
+        let mut ui = Ui::new(None);
+        ui.meetings = demo_meetings();
+        ui.meetings[3].subject = "Organic Chemistry".into();
+        ui.search = Some(TextEdit::new("chemis"));
+        let hits: Vec<_> = ui.meetings.iter().filter(|m| ui.matches_search(m)).collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject, "Organic Chemistry");
+    }
+
+    #[test]
+    fn a_busy_session_moves_later_and_its_markers_follow() {
+        let dir = std::env::temp_dir().join(format!("hushnote-ui-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = Ui::new(None);
+        ui.config.notes_dir = dir.clone();
+        let mut m = Meeting::new(&dir, Mode::Class);
+        m.subject = "Calculus I".into();
+        m.title = "Limits".into();
+        m.save().unwrap();
+        let old = m.file.clone();
+        ui.meetings = vec![m];
+        ui.unseen.insert(old.clone());
+        ui.warned.insert(old.clone());
+        ui.summarizing = Some(old.clone());
+        ui.try_relocate(&old);
+        assert!(old.exists() && ui.relocate_pending.contains(&old), "postponed while summarizing");
+        ui.retry_relocations();
+        assert_eq!(ui.meetings[0].file, old, "still busy");
+        ui.summarizing = None;
+        ui.retry_relocations();
+        let new = ui.meetings[0].file.clone();
+        assert_ne!(new, old);
+        assert!(new.exists() && !old.exists());
+        assert!(ui.relocate_pending.is_empty());
+        assert!(ui.unseen.contains(&new) && ui.warned.contains(&new) && !ui.unseen.contains(&old));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relocating_in_demo_mode_writes_nothing() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        let before = ui.meetings[0].file.clone();
+        ui.try_relocate(&before);
+        assert_eq!(ui.meetings[0].file, before);
+        assert!(ui.relocate_pending.is_empty());
+    }
+
+    #[test]
+    fn exporting_in_demo_mode_writes_nothing() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.meetings = demo_meetings();
+        ui.selected = Some(0);
+        ui.export(false);
+        assert!(ui.exported.is_none() && ui.status.as_ref().is_some_and(|s| s.1));
+        ui.export(true); // no cards: a clear message, nothing exported
+        assert!(ui.status.as_ref().unwrap().0.contains("No review questions"));
     }
 
     #[test]
