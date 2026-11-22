@@ -7,6 +7,7 @@
 
 mod audio;
 mod config;
+mod export;
 mod llm;
 mod models;
 mod ollama;

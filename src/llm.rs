@@ -8,6 +8,7 @@
 
 use crate::config::Summaries;
 use crate::session::Line;
+use crate::store::{Card, Meeting, Mode, Turn};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
@@ -20,62 +21,105 @@ Markdown. Use only what is in the transcript and the user's notes; never invent 
 transcript is automatic and may contain wrong words: interpret them with common sense. \"You\" is \
 the user; \"Them\" are the other participants.";
 
+const CLASS_SYSTEM: &str = "You are an assistant that writes clear, accurate class notes for a \
+student, in Markdown. Use only what is in the transcript and the student's notes; never invent \
+facts, definitions or formulas. The transcript is automatic and may contain wrong words (names of \
+terms and symbols especially): interpret them with common sense. \"You\" is the student; \"Them\" \
+is the teacher or other students.";
+
+fn system(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Meeting => SYSTEM,
+        Mode::Class => CLASS_SYSTEM,
+    }
+}
+
 /// The section headings, fixed per language so a small model can't half-translate them.
 struct Sections {
     language: &'static str,
-    key_points: &'static str,
-    decisions: &'static str,
-    action_items: &'static str,
-    open_questions: &'static str,
+    mode: Mode,
+    /// The four headings, in the order they are written.
+    headings: [&'static str; 4],
     none: &'static str,
     /// How a due day looks, e.g. "Thu or Mar 9".
     due: &'static str,
 }
 
-const SPANISH: Sections = Sections {
+const MEETING_ES: Sections = Sections {
     language: "Spanish",
-    key_points: "Puntos clave",
-    decisions: "Decisiones",
-    action_items: "Pendientes",
-    open_questions: "Preguntas abiertas",
+    mode: Mode::Meeting,
+    headings: ["Puntos clave", "Decisiones", "Pendientes", "Preguntas abiertas"],
     none: "Ninguno",
     due: "jue or 9 mar",
 };
 
-const ENGLISH: Sections = Sections {
+const MEETING_EN: Sections = Sections {
     language: "English",
-    key_points: "Key points",
-    decisions: "Decisions",
-    action_items: "Action items",
-    open_questions: "Open questions",
+    mode: Mode::Meeting,
+    headings: ["Key points", "Decisions", "Action items", "Open questions"],
     none: "None",
     due: "Thu or Mar 9",
 };
 
-fn sections(language: &str) -> &'static Sections {
-    if language == "en" { &ENGLISH } else { &SPANISH }
+const CLASS_ES: Sections = Sections {
+    language: "Spanish",
+    mode: Mode::Class,
+    headings: ["Temas vistos", "Conceptos clave y definiciones", "Fórmulas o ejemplos", "Tareas y fechas de entrega"],
+    none: "Ninguno",
+    due: "jue or 9 mar",
+};
+
+const CLASS_EN: Sections = Sections {
+    language: "English",
+    mode: Mode::Class,
+    headings: ["Topics covered", "Key concepts and definitions", "Formulas or examples", "Tasks and due dates"],
+    none: "None",
+    due: "Thu or Mar 9",
+};
+
+fn sections(language: &str, mode: Mode) -> &'static Sections {
+    match (language == "en", mode) {
+        (true, Mode::Meeting) => &MEETING_EN,
+        (false, Mode::Meeting) => &MEETING_ES,
+        (true, Mode::Class) => &CLASS_EN,
+        (false, Mode::Class) => &CLASS_ES,
+    }
 }
 
-/// What the notes must look like, with the headings written out in the meeting's language.
+/// What the notes must look like, with the headings written out in the session's language.
 fn format(s: &Sections) -> String {
+    let [h0, h1, h2, h3] = s.headings;
+    let (none, due) = (s.none, s.due);
+    let task_rule = format!(
+        "a task list, one line each: `- [ ] Owner does the task · due`. Add ` · due` only when a day \
+         or date was said, as a short word such as {due}. \"{none}\" if there were none"
+    );
+    let body = match s.mode {
+        Mode::Meeting => format!(
+            "## {h0}\n(3 to 6 bullets with the most important things that were said: facts, requirements, \
+             explanations, figures. Not the decisions or the tasks)\n\
+             ## {h1}\n(bullets with what was decided or agreed; \"{none}\" if nothing was)\n\
+             ## {h2}\n({task_rule})\n\
+             ## {h3}\n(bullets; \"{none}\" if there were none)\n\
+             Put names, dates, amounts and product names in `inline code` sparingly, only when it helps \
+             scanning. If the user took notes, honour them: they are what matters most to the user, so \
+             expand them with details from the transcript."
+        ),
+        Mode::Class => format!(
+            "## {h0}\n(bullets with the subjects the class went through, in the order they came up)\n\
+             ## {h1}\n(one bullet per concept: `**Term**: its definition or explanation`, as the teacher \
+             gave it)\n\
+             ## {h2}\n(the formulas, rules and worked examples that were shown; write formulas in `inline \
+             code`; \"{none}\" if there were none)\n\
+             ## {h3}\n({task_rule}; include homework, readings, exams and projects)\n\
+             If the student took notes, honour them: they are what matters most, so expand them with \
+             details from the transcript."
+        ),
+    };
     format!(
-        "Write the notes in {lang}, with exactly these four sections and these exact headings:\n\
-         ## {kp}\n(3 to 6 bullets with the most important things that were said: facts, requirements, \
-         explanations, figures. Not the decisions or the tasks)\n\
-         ## {d}\n(bullets with what was decided or agreed; \"{none}\" if nothing was)\n\
-         ## {a}\n(a task list, one line each: `- [ ] Owner does the task · due`. Add ` · due` only \
-         when a day or date was said, as a short word such as {due}. \"{none}\" if there were none)\n\
-         ## {q}\n(bullets; \"{none}\" if there were none)\n\
-         Put names, dates, amounts and product names in `inline code` sparingly, only when it helps \
-         scanning. If the user took notes, honour them: they are what matters most to the user, so \
-         expand them with details from the transcript. Add nothing before or after the sections.",
+        "Write the notes in {lang}, with exactly these four sections and these exact headings:\n{body} \
+         Add nothing before or after the sections.",
         lang = s.language,
-        kp = s.key_points,
-        d = s.decisions,
-        a = s.action_items,
-        q = s.open_questions,
-        none = s.none,
-        due = s.due,
     )
 }
 
@@ -88,6 +132,8 @@ pub struct Llm {
     pub cli_model: String,
     /// The meeting's language, "es" or "en": the notes are written in it.
     pub language: String,
+    /// Whether the notes are for a meeting or a class.
+    pub mode: Mode,
 }
 
 impl Llm {
@@ -98,7 +144,13 @@ impl Llm {
             model: c.llm_model.clone(),
             cli_model: c.summary_cli_model.clone(),
             language: c.language.clone(),
+            mode: Mode::Meeting,
         }
+    }
+
+    pub fn with_mode(mut self, mode: Mode) -> Llm {
+        self.mode = mode;
+        self
     }
 
     /// Who writes the summary, for "Summary by …": "Qwen3 4B", "Claude", "Claude (sonnet)".
@@ -380,6 +432,7 @@ impl Llm {
         if transcript.trim().is_empty() && notes.trim().is_empty() {
             return Err("There is no transcript and no notes to summarize.".into());
         }
+        let sections = sections(&self.language, self.mode);
         let size = if self.provider == Summaries::Local { PART_CHARS } else { CLI_PART_CHARS };
         let pieces = parts(&transcript, size);
         let material = if pieces.len() <= 1 {
@@ -387,32 +440,339 @@ impl Llm {
         } else {
             let mut partial = String::new();
             for (i, piece) in pieces.iter().enumerate() {
+                let (what, extract) = match self.mode {
+                    Mode::Meeting => ("meeting", "the key points, decisions and action items (with owners)"),
+                    Mode::Class => (
+                        "class",
+                        "the topics, every concept with its definition, the formulas and examples, \
+                         and the tasks with their due dates",
+                    ),
+                };
                 let prompt = format!(
-                    "This is part {} of {} of a meeting. Extract the key points, decisions and \
-                     action items (with owners) as bullets, in {}. Bullets only.\n\n{piece}",
+                    "This is part {} of {} of a {what}. Extract {extract} as bullets, in {}. \
+                     Bullets only.\n\n{piece}",
                     i + 1,
                     pieces.len(),
-                    sections(&self.language).language
+                    sections.language
                 );
-                let summary = self.chat(SYSTEM, &prompt, |_| {})?;
+                let summary = self.chat(system(self.mode), &prompt, |_| {})?;
                 partial.push_str(&format!("### Part {}\n{summary}\n\n", i + 1));
             }
-            format!("Partial notes of the meeting, in order:\n{partial}")
+            let what = if self.mode == Mode::Class { "class" } else { "meeting" };
+            format!("Partial notes of the {what}, in order:\n{partial}")
         };
         let notes = if notes.trim().is_empty() { "(the user took no notes)".to_string() } else { notes.to_string() };
-        let prompt = format!("The user's notes:\n{notes}\n\n{material}\n\n{}", format(sections(&self.language)));
-        self.chat(SYSTEM, &prompt, on_delta)
+        let prompt = format!("The user's notes:\n{notes}\n\n{material}\n\n{}", format(sections));
+        self.chat(system(self.mode), &prompt, on_delta)
     }
 
     /// A short title for the meeting.
     pub fn title(&self, summary: &str) -> Result<String, String> {
+        let what = if self.mode == Mode::Class { "class" } else { "meeting" };
         let prompt = format!(
-            "Write a 3 to 6 word title for this meeting, in {}, without quotes or a final period:\n\n{summary}",
-            sections(&self.language).language
+            "Write a 3 to 6 word title for this {what}, in {}, without quotes or a final period:\n\n{summary}",
+            sections(&self.language, self.mode).language
         );
-        let t = self.chat(SYSTEM, &prompt, |_| {})?;
+        let t = self.chat(system(self.mode), &prompt, |_| {})?;
         Ok(t.lines().next().unwrap_or("").trim_matches(['"', '#', ' ', '*']).to_string())
     }
+
+    /// 5 to 10 review questions with answers, from the class summary (or, with no summary
+    /// yet, the start of the transcript) and the student's notes.
+    pub fn review(&self, summary: &str, notes: &str, lines: &[Line]) -> Result<Vec<Card>, String> {
+        let material = if summary.trim().is_empty() {
+            let size = if self.provider == Summaries::Local { PART_CHARS } else { CLI_PART_CHARS };
+            let t = parts(&transcript_text(lines), size).swap_remove(0);
+            if t.trim().is_empty() && notes.trim().is_empty() {
+                return Err("There is no summary, transcript or notes to write review questions from.".into());
+            }
+            format!("Transcript of the class (automatic, may contain wrong words):\n{t}")
+        } else {
+            format!("Summary of the class:\n{}", summary.trim())
+        };
+        let answer = self.chat(system(self.mode), &review_prompt(&material, notes, &self.language), |_| {})?;
+        let cards = parse_review(&answer);
+        if cards.is_empty() {
+            return Err("The model did not return usable questions. Try again, or pick Claude or Codex.".into());
+        }
+        Ok(cards)
+    }
+}
+
+/// Characters of a whole "Ask your notes" prompt (material, chat history and question) that the
+/// local model is given: about two parts' worth. The hosted models use the large limit.
+pub const LOCAL_ASK_CHARS: usize = PART_CHARS * 2;
+/// Earlier turns of the chat sent along, so follow-up questions work.
+pub const HISTORY_TURNS: usize = 6;
+/// An earlier answer is cut to this many characters when it goes back in the prompt.
+const HISTORY_ANSWER_CHARS: usize = 1_200;
+/// Room kept for the instructions and the question's framing.
+const ASK_OVERHEAD: usize = 600;
+
+/// What a question is asked about.
+pub enum Scope<'a> {
+    /// The open session: summary, notes, review questions and as much transcript as fits.
+    Session(&'a Meeting),
+    /// Every class of a subject (the summaries only), in any order.
+    Subject { name: &'a str, classes: Vec<&'a Meeting> },
+}
+
+/// The first `max` characters, cut at a line break when there is one.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    match cut.rfind('\n') {
+        Some(i) if i > 0 => cut[..i].to_string(),
+        _ => cut,
+    }
+}
+
+fn used(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// The material the answer must come from, at most about `limit` characters.
+pub fn ask_context(scope: &Scope, limit: usize) -> String {
+    match scope {
+        Scope::Session(m) => session_context(m, limit),
+        Scope::Subject { name, classes } => subject_context(name, classes, limit),
+    }
+}
+
+fn session_context(m: &Meeting, limit: usize) -> String {
+    let what = if m.mode == Mode::Class { "class" } else { "meeting" };
+    let mut out = format!("This {what}: \"{}\" ({})\n", m.title.trim(), m.date);
+    // The summary and the notes come first and are never dropped, only cut if they alone are
+    // too long.
+    let mut left = limit.saturating_sub(used(&out));
+    fn add(out: &mut String, left: &mut usize, label: &str, body: &str) {
+        if body.trim().is_empty() {
+            return;
+        }
+        let body = clip(body.trim(), left.saturating_sub(used(label) + 4));
+        *left = left.saturating_sub(used(&body) + used(label) + 4);
+        out.push_str(&format!("\n{label}:\n{body}\n"));
+    }
+    add(&mut out, &mut left, "Summary", &m.summary);
+    add(&mut out, &mut left, "The student's own notes", &m.notes);
+    if !m.review.is_empty() {
+        let cards: String = m.review.iter().map(|c| format!("Q: {}\nA: {}\n", c.question.trim(), c.answer.trim())).collect();
+        if used(&cards) + 100 <= left {
+            add(&mut out, &mut left, "Review questions", &cards);
+        }
+    }
+    let transcript = transcript_text(&m.lines);
+    if !transcript.trim().is_empty() {
+        let label = "Transcript (automatic, may contain wrong words)";
+        if used(&transcript) <= left.saturating_sub(used(label) + 4) {
+            add(&mut out, &mut left, label, &transcript);
+        } else if left > 1_000 {
+            let body = clip(&transcript, left - used(label) - 80);
+            out.push_str(&format!("\n{label}, cut: only the beginning of the class fits:\n{body}\n"));
+        } else {
+            out.push_str("\n(The transcript is left out because it does not fit.)\n");
+        }
+    }
+    out
+}
+
+fn subject_context(name: &str, classes: &[&Meeting], limit: usize) -> String {
+    let mut sorted: Vec<&Meeting> = classes.to_vec();
+    sorted.sort_by(|a, b| a.date.cmp(&b.date));
+    let blocks: Vec<String> = sorted
+        .iter()
+        .filter_map(|m| {
+            let body = if !m.summary.trim().is_empty() { m.summary.trim() } else { m.notes.trim() };
+            (!body.is_empty()).then(|| format!("### {} ({})\n{}\n", m.title.trim(), m.date, body))
+        })
+        .collect();
+    let header = |kept: usize| {
+        let mut h = format!("Notes of {} classes of the subject \"{name}\", oldest first. Each starts with the class title and date.\n", kept);
+        if kept < blocks.len() {
+            h.push_str(&format!("Only the {kept} most recent of {} classes fit here; the older ones are left out.\n", blocks.len()));
+        }
+        h
+    };
+    // Newest first until the limit, then back to chronological order.
+    let mut kept: Vec<String> = Vec::new();
+    let mut size = used(&header(blocks.len())) + 1;
+    for b in blocks.iter().rev() {
+        if !kept.is_empty() && size + used(b) + 1 > limit {
+            break;
+        }
+        let b = if kept.is_empty() { clip(b, limit.saturating_sub(size)) } else { b.clone() };
+        size += used(&b) + 1;
+        kept.push(b);
+    }
+    kept.reverse();
+    format!("{}\n{}", header(kept.len()), kept.join("\n"))
+}
+
+/// The last turns of the chat as text for the prompt.
+pub fn history_text(history: &[Turn]) -> String {
+    let from = history.len().saturating_sub(HISTORY_TURNS);
+    history[from..]
+        .iter()
+        .map(|t| format!("Student: {}\nYou: {}\n", t.question.trim(), clip(t.answer.trim(), HISTORY_ANSWER_CHARS)))
+        .collect()
+}
+
+fn ask_system(language: &str) -> String {
+    let lang = sections(language, Mode::Class).language;
+    format!(
+        "You answer a student's questions about their own class or meeting notes. Answer only with \
+         what is in the material you are given; never use outside knowledge and never invent \
+         facts. If the material does not cover the question, say so clearly: \"That wasn't \
+         covered in these notes.\" (in {lang}). Write the answer in {lang}, in short Markdown. When \
+         the material has several classes, say which class (title or date) each point comes from."
+    )
+}
+
+impl Llm {
+    /// The characters the whole prompt may use with this provider.
+    fn ask_limit(&self) -> usize {
+        if self.provider == Summaries::Local { LOCAL_ASK_CHARS } else { CLI_PART_CHARS }
+    }
+
+    /// How many characters the material may take once the chat history and the question are
+    /// counted, for `ask_context`.
+    pub fn ask_budget(&self, history: &[Turn], question: &str) -> usize {
+        let rest = used(&history_text(history)) + used(question) + ASK_OVERHEAD;
+        self.ask_limit().saturating_sub(rest).max(1_000)
+    }
+
+    /// Answers `question` from `context` (see `ask_context`), after the earlier `history`;
+    /// `on_delta` receives the answer as it arrives.
+    pub fn ask(&self, context: &str, history: &[Turn], question: &str, on_delta: impl FnMut(&str)) -> Result<String, String> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err("Type a question first.".into());
+        }
+        let chat = history_text(history);
+        let chat = if chat.is_empty() { String::new() } else { format!("Conversation so far:\n{chat}\n") };
+        let prompt = format!("Material:\n{context}\n{chat}The student's question:\n{question}");
+        let answer = self.chat(&ask_system(&self.language), &prompt, on_delta)?;
+        if answer.trim().is_empty() {
+            return Err("The model returned an empty answer. Try again.".into());
+        }
+        Ok(answer)
+    }
+}
+
+/// Most cards a review keeps.
+pub const MAX_CARDS: usize = 10;
+
+/// The prompt for the review questions: a strict, simple `Q:` / `A:` format.
+fn review_prompt(material: &str, notes: &str, language: &str) -> String {
+    let lang = sections(language, Mode::Class).language;
+    let notes = if notes.trim().is_empty() { "(the student took no notes)" } else { notes.trim() };
+    format!(
+        "The student's notes:\n{notes}\n\n{material}\n\n\
+         Write between 5 and 10 review questions, each with its answer, to help the student study \
+         this class. Write them in {lang}. Cover the most important concepts, definitions and \
+         formulas. Use only what is in the material above; never invent facts. Each question must \
+         make sense on its own. Each answer is one to three sentences.\n\
+         Use exactly this format, with the letters Q and A, and nothing before or after:\n\
+         Q: the first question\nA: its answer\n\nQ: the second question\nA: its answer"
+    )
+}
+
+#[derive(PartialEq)]
+enum Tag {
+    Q,
+    A,
+}
+
+/// The line without list or numbering marks, bold markers or heading marks.
+fn bare(line: &str) -> String {
+    let mut l = line.replace("**", "").replace("__", "");
+    loop {
+        let t = l.trim_start();
+        let digits = t.chars().take_while(char::is_ascii_digit).count();
+        let next = if let Some(r) = t.strip_prefix(['-', '*', '•', '#', '>']) {
+            r
+        } else if digits > 0 && t[digits..].starts_with(['.', ')']) {
+            &t[digits + 1..]
+        } else {
+            break;
+        };
+        l = next.to_string();
+    }
+    l.trim().to_string()
+}
+
+/// `Q: text` or `A: text`, also as Q1:, P:/R:, Pregunta:/Respuesta:, Question:/Answer:.
+fn tagged(line: &str) -> Option<(Tag, String)> {
+    let l = bare(line);
+    let (label, rest) = l.split_once(':')?;
+    let label = label.trim().to_lowercase();
+    let label = label.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ');
+    match label {
+        "q" | "p" | "question" | "pregunta" => Some((Tag::Q, rest.trim().to_string())),
+        "a" | "r" | "answer" | "respuesta" => Some((Tag::A, rest.trim().to_string())),
+        _ => None,
+    }
+}
+
+/// Reads the model's `Q:` / `A:` blocks into cards. Forgiving with numbering, markdown,
+/// Spanish labels, multi-line answers and chatter around the list; drops cards that lack
+/// a question or an answer and keeps at most [`MAX_CARDS`].
+pub fn parse_review(text: &str) -> Vec<Card> {
+    let mut cards: Vec<Card> = Vec::new();
+    let mut cur: Option<(String, Option<String>)> = None; // question, answer
+    let mut blank = false;
+    fn close(cur: &mut Option<(String, Option<String>)>, cards: &mut Vec<Card>) {
+        if let Some((q, Some(a))) = cur.take() {
+            if !q.trim().is_empty() && !a.trim().is_empty() {
+                cards.push(Card { question: q.trim().to_string(), answer: a.trim().to_string() });
+            }
+        }
+    }
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            blank = true;
+            continue;
+        }
+        if line.chars().all(|c| matches!(c, '-' | '*' | '_' | '=' | ' ')) {
+            continue; // a separator
+        }
+        match tagged(line) {
+            Some((Tag::Q, rest)) => {
+                close(&mut cur, &mut cards);
+                cur = Some((rest, None));
+            }
+            Some((Tag::A, rest)) => {
+                if let Some((_, a)) = &mut cur {
+                    if a.is_none() {
+                        *a = Some(rest);
+                    } else {
+                        a.as_mut().unwrap().push_str(&format!("\n{rest}"));
+                    }
+                }
+            }
+            None => {
+                // After a blank line only a list item or an indented line continues the block;
+                // a plain paragraph is the model talking to the reader.
+                let listed = bare(line) != line.replace("**", "");
+                if blank && !listed && !raw.starts_with([' ', '\t']) {
+                    close(&mut cur, &mut cards);
+                } else if let Some((q, a)) = &mut cur {
+                    let field = a.as_mut().unwrap_or(q);
+                    if !field.is_empty() {
+                        field.push('\n');
+                    }
+                    field.push_str(line);
+                }
+            }
+        }
+        blank = false;
+    }
+    close(&mut cur, &mut cards);
+    cards.truncate(MAX_CARDS);
+    cards
 }
 
 #[cfg(test)]
@@ -458,7 +818,7 @@ mod tests {
         ];
         let wanted = std::env::var("HUSHNOTE_CLI").unwrap_or_else(|_| "claude,codex,opencode".into());
         for provider in Summaries::ALL.into_iter().filter(|p| wanted.contains(&p.label().to_lowercase())) {
-            let llm = Llm { provider, url: String::new(), model: String::new(), cli_model: String::new(), language: "es".into() };
+            let llm = Llm { provider, url: String::new(), model: String::new(), cli_model: String::new(), language: "es".into(), mode: Mode::Meeting };
             let start = std::time::Instant::now();
             let summary = llm.summarize("", &lines, |_| {}).unwrap_or_else(|e| panic!("{e}"));
             let title = llm.title(&summary).unwrap();
@@ -477,14 +837,154 @@ mod tests {
 
     #[test]
     fn headings_follow_the_language() {
-        let es = format(sections("es"));
+        let es = format(sections("es", Mode::Meeting));
         assert!(es.contains("## Pendientes") && es.contains("in Spanish") && !es.contains("## Action items"));
-        assert!(format(sections("en")).contains("## Action items"));
+        assert!(format(sections("en", Mode::Meeting)).contains("## Action items"));
+    }
+
+    #[test]
+    fn meeting_sections_are_unchanged() {
+        assert_eq!(sections("en", Mode::Meeting).headings, ["Key points", "Decisions", "Action items", "Open questions"]);
+        let p = format(sections("en", Mode::Meeting));
+        assert_eq!(p.matches("\n## ").count(), 4);
+        assert!(!p.contains("Topics covered"));
+    }
+
+    #[test]
+    fn class_sections_in_both_languages() {
+        let en = sections("en", Mode::Class);
+        assert_eq!(en.headings, ["Topics covered", "Key concepts and definitions", "Formulas or examples", "Tasks and due dates"]);
+        let p = format(en);
+        for h in en.headings {
+            assert!(p.contains(&format!("## {h}\n")), "{h}");
+        }
+        assert_eq!(p.matches("\n## ").count(), 4);
+        assert!(p.contains("- [ ] Owner does the task · due"), "class tasks reuse the task format");
+        assert!(!p.contains("Decisions") && !p.contains("Open questions"));
+
+        let es = sections("es", Mode::Class);
+        assert_eq!(es.headings[3], "Tareas y fechas de entrega");
+        let p = format(es);
+        assert!(p.contains("in Spanish") && p.contains("## Temas vistos") && !p.contains("## Topics covered"));
+    }
+
+    #[test]
+    fn parse_review_reads_a_clean_answer() {
+        let c = parse_review("Q: What is a limit?\nA: The value f(x) approaches.\n\nQ: And a derivative?\nA: A rate of change.");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], Card { question: "What is a limit?".into(), answer: "The value f(x) approaches.".into() });
+        assert_eq!(c[1].answer, "A rate of change.");
+    }
+
+    #[test]
+    fn parse_review_survives_messy_output() {
+        let messy = "A: stray answer\nSure! Here are your questions:\n\n\
+            1. **Q:** What is entropy?\n   **A:** A measure of disorder.\n   It never decreases in a closed system.\n\n\
+            2) Pregunta: ¿Qué es la energía?\n   Respuesta: La capacidad de hacer trabajo.\n\n\
+            ---\n\
+            - P: ¿Qué dice la segunda ley?\n- R: La entropía no disminuye.\n\n\
+            **Question 4**: Define heat\n**Answer**: Energy in transit.\n\n\
+            Q: Incomplete question with no answer\n\n\
+            Q: List answer?\nA: Three things:\n- one\n\n- two\n\nHope this helps! Good luck.";
+        let c = parse_review(messy);
+        let qs: Vec<&str> = c.iter().map(|c| c.question.as_str()).collect();
+        assert_eq!(qs, ["What is entropy?", "¿Qué es la energía?", "¿Qué dice la segunda ley?", "Define heat", "List answer?"]);
+        assert_eq!(c[0].answer, "A measure of disorder.\nIt never decreases in a closed system.");
+        assert_eq!(c[1].answer, "La capacidad de hacer trabajo.");
+        assert_eq!(c[2].answer, "La entropía no disminuye.");
+        assert_eq!(c[3].answer, "Energy in transit.");
+        assert_eq!(c[4].answer, "Three things:\n- one\n- two", "the closing chatter is not part of the answer");
+    }
+
+    #[test]
+    fn parse_review_drops_incomplete_cards_and_caps_at_ten() {
+        assert!(parse_review("Q: Only a question\nQ: Another\nA:\n").is_empty());
+        assert!(parse_review("A: no question here").is_empty());
+        assert!(parse_review("").is_empty());
+        assert!(parse_review("I could not write questions.").is_empty());
+        let many: String = (1..=14).map(|i| format!("Q: q{i}?\nA: a{i}\n\n")).collect();
+        let c = parse_review(&many);
+        assert_eq!(c.len(), MAX_CARDS);
+        assert_eq!(c[9].question, "q10?");
+    }
+
+    #[test]
+    fn the_review_prompt_asks_for_five_to_ten_questions_in_the_language() {
+        let es = review_prompt("Summary of the class:\n- x", "", "es");
+        assert!(es.contains("between 5 and 10 review questions") && es.contains("in Spanish"));
+        assert!(es.contains("Q: the first question\nA: its answer") && es.contains("(the student took no notes)"));
+        let en = review_prompt("Summary of the class:\n- x", "my note", "en");
+        assert!(en.contains("in English") && !en.contains("Spanish") && en.contains("my note"));
     }
 
     #[test]
     fn clock_format() {
         assert_eq!(clock(65_000), "01:05");
         assert_eq!(clock(3_725_000), "1:02:05");
+    }
+
+    fn class(title: &str, date: &str, summary: &str) -> Meeting {
+        Meeting { title: title.into(), date: date.into(), summary: summary.into(), mode: Mode::Class, ..Default::default() }
+    }
+
+    #[test]
+    fn session_context_has_summary_notes_and_review_then_the_transcript() {
+        let mut m = class("Limits", "2026-11-03 10:00", "SUMMARY-TEXT");
+        m.notes = "MY-NOTE".into();
+        m.review = vec![Card { question: "What is a limit?".into(), answer: "A value.".into() }];
+        m.lines = vec![Line { speaker: crate::audio::Speaker::Me, t_ms: 1000, text: "spoken words".into() }];
+        let c = ask_context(&Scope::Session(&m), CLI_PART_CHARS);
+        for part in ["Limits", "SUMMARY-TEXT", "MY-NOTE", "What is a limit?", "spoken words"] {
+            assert!(c.contains(part), "missing {part}");
+        }
+        assert!(c.find("SUMMARY-TEXT") < c.find("spoken words"));
+    }
+
+    #[test]
+    fn a_long_transcript_is_cut_for_the_local_model_but_not_for_the_cli() {
+        let mut m = class("Limits", "2026-11-03 10:00", "SUMMARY-TEXT");
+        m.notes = "MY-NOTE".into();
+        m.lines = (0..2000).map(|i| Line { speaker: crate::audio::Speaker::Them, t_ms: i * 1000, text: format!("sentence number {i}") }).collect();
+        let local = ask_context(&Scope::Session(&m), LOCAL_ASK_CHARS);
+        assert!(used(&local) <= LOCAL_ASK_CHARS, "{}", used(&local));
+        assert!(local.contains("SUMMARY-TEXT") && local.contains("MY-NOTE"));
+        assert!(local.contains("sentence number 0") && !local.contains("sentence number 1999") && local.contains("cut"));
+        let cli = ask_context(&Scope::Session(&m), CLI_PART_CHARS);
+        assert!(cli.contains("sentence number 1999") && !cli.contains("cut"));
+        // With almost no room the transcript is dropped, the summary and notes stay.
+        let tiny = ask_context(&Scope::Session(&m), 300);
+        assert!(tiny.contains("SUMMARY-TEXT") && tiny.contains("MY-NOTE") && !tiny.contains("sentence number 0"));
+    }
+
+    #[test]
+    fn subject_context_is_chronological_without_transcripts() {
+        let mut a = class("Second", "2026-11-10 10:00", "sum two");
+        a.lines = vec![Line { speaker: crate::audio::Speaker::Me, t_ms: 0, text: "TRANSCRIPT-WORDS".into() }];
+        let b = class("First", "2026-11-03 10:00", "sum one");
+        let c = ask_context(&Scope::Subject { name: "Calculus I", classes: vec![&a, &b] }, CLI_PART_CHARS);
+        assert!(c.find("First (2026-11-03 10:00)").unwrap() < c.find("Second (2026-11-10 10:00)").unwrap());
+        assert!(c.contains("Calculus I") && !c.contains("TRANSCRIPT-WORDS") && !c.contains("left out"));
+    }
+
+    #[test]
+    fn subject_context_keeps_the_most_recent_classes_that_fit() {
+        let big = "x".repeat(600);
+        let ms: Vec<Meeting> = (1..=5).map(|d| class(&format!("Class {d}"), &format!("2026-11-0{d} 10:00"), &big)).collect();
+        let c = ask_context(&Scope::Subject { name: "Physics", classes: ms.iter().collect() }, 1_900);
+        assert!(c.contains("most recent") && c.contains("left out"));
+        assert!(c.contains("Class 5") && c.contains("Class 4") && !c.contains("Class 1"));
+        assert!(c.find("Class 4") < c.find("Class 5"));
+        assert!(used(&c) <= 1_900);
+    }
+
+    #[test]
+    fn only_the_last_turns_go_back_in_the_prompt() {
+        let turns: Vec<Turn> = (0..10).map(|i| Turn { question: format!("question {i}"), answer: "a".repeat(5_000), scope: String::new() }).collect();
+        let h = history_text(&turns);
+        assert!(!h.contains("question 3") && h.contains("question 4") && h.contains("question 9"));
+        assert!(used(&h) < HISTORY_TURNS * (HISTORY_ANSWER_CHARS + 60));
+        let local = Llm { provider: Summaries::Local, url: String::new(), model: String::new(), cli_model: String::new(), language: "en".into(), mode: Mode::Class };
+        assert!(local.ask_budget(&turns, "q") < LOCAL_ASK_CHARS - used(&h));
+        assert!(ask_system("es").contains("Spanish") || ask_system("es").contains("español") || ask_system("es").contains("wasn't"));
     }
 }
