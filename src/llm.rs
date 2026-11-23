@@ -21,8 +21,8 @@ Markdown. Use only what is in the transcript and the user's notes; never invent 
 transcript is automatic and may contain wrong words: interpret them with common sense. \"You\" is \
 the user; \"Them\" are the other participants.";
 
-const CLASS_SYSTEM: &str = "You are an assistant that writes clear, accurate class notes for a \
-student, in Markdown. Use only what is in the transcript and the student's notes; never invent \
+const CLASS_SYSTEM: &str = "You are an assistant that writes clear, accurate study notes from a \
+class for a student, in Markdown. Use only what is in the transcript and the student's notes; never invent \
 facts, definitions or formulas. The transcript is automatic and may contain wrong words (names of \
 terms and symbols especially): interpret them with common sense. \"You\" is the student; \"Them\" \
 is the teacher or other students.";
@@ -43,6 +43,9 @@ struct Sections {
     none: &'static str,
     /// How a due day looks, e.g. "Thu or Mar 9".
     due: &'static str,
+    /// Class mode only: the labels of "Core idea" and of the stressed-point blockquote.
+    core: &'static str,
+    note: &'static str,
 }
 
 const MEETING_ES: Sections = Sections {
@@ -51,6 +54,8 @@ const MEETING_ES: Sections = Sections {
     headings: ["Puntos clave", "Decisiones", "Pendientes", "Preguntas abiertas"],
     none: "Ninguno",
     due: "jue or 9 mar",
+    core: "",
+    note: "",
 };
 
 const MEETING_EN: Sections = Sections {
@@ -59,22 +64,29 @@ const MEETING_EN: Sections = Sections {
     headings: ["Key points", "Decisions", "Action items", "Open questions"],
     none: "None",
     due: "Thu or Mar 9",
+    core: "",
+    note: "",
 };
 
 const CLASS_ES: Sections = Sections {
     language: "Spanish",
     mode: Mode::Class,
-    headings: ["Temas vistos", "Conceptos clave y definiciones", "Fórmulas o ejemplos", "Tareas y fechas de entrega"],
+    // In short, takeaways, tasks, doubts. The topic sections in between are numbered.
+    headings: ["En resumen", "Ideas clave", "Tareas y entregas", "Dudas para revisar"],
     none: "Ninguno",
     due: "jue or 9 mar",
+    core: "Idea central",
+    note: "Ojo",
 };
 
 const CLASS_EN: Sections = Sections {
     language: "English",
     mode: Mode::Class,
-    headings: ["Topics covered", "Key concepts and definitions", "Formulas or examples", "Tasks and due dates"],
+    headings: ["In short", "Key takeaways", "Tasks and due dates", "To double-check"],
     none: "None",
     due: "Thu or Mar 9",
+    core: "Core idea",
+    note: "Note",
 };
 
 fn sections(language: &str, mode: Mode) -> &'static Sections {
@@ -106,19 +118,35 @@ fn format(s: &Sections) -> String {
              expand them with details from the transcript."
         ),
         Mode::Class => format!(
-            "## {h0}\n(bullets with the subjects the class went through, in the order they came up)\n\
-             ## {h1}\n(one bullet per concept: `**Term**: its definition or explanation`, as the teacher \
-             gave it)\n\
-             ## {h2}\n(the formulas, rules and worked examples that were shown; write formulas in `inline \
-             code`; \"{none}\" if there were none)\n\
-             ## {h3}\n({task_rule}; include homework, readings, exams and projects)\n\
-             If the student took notes, honour them: they are what matters most, so expand them with \
-             details from the transcript."
+            "## {h0}\n(a paragraph of 2 to 3 sentences: what the class was about and why it matters)\n\
+             ## {h1}\n(3 to 7 one-line bullets with the things worth remembering)\n\
+             ## 1. <Topic name>\n**{core}:** one sentence\n\
+             - **Term**: its definition in plain words, as it was explained\n  - nested sub-points: steps, \
+             causes and effects, details\n\
+             - the examples that were given; write formulas and rules in `inline code` (a fenced block if \
+             they take several lines)\n\
+             - a Markdown table whenever two or more things are contrasted\n\
+             > **{note}:** something that was stressed or a common mistake (only when there is one)\n\
+             ## 2. <Next topic>\n(same shape. One numbered section per main topic, grouped by topic and \
+             not in transcript order, each in the order it is best taught; roughly one per 8 to 10 minutes \
+             of class, and at least 2 when the content allows. Keep each definition, formula and example \
+             inside the topic it belongs to. Be thorough, not thin)\n\
+             ## {h2}\n({task_rule}; include homework, readings, exams and projects)\n\
+             ## {h3}\n(bullets with passages that were unclear, contradictory or probably mis-transcribed, \
+             quoting the odd phrase instead of guessing; \"{none}\" if there were none)\n\
+             Write study notes: no emojis, no speaker names and no \"the teacher said\". One idea per \
+             bullet, with the key terms in bold. If the student took notes, honour them: they are what \
+             matters most, so expand them with details from the transcript.",
+            core = s.core,
+            note = s.note,
         ),
     };
+    let intro = match s.mode {
+        Mode::Meeting => "with exactly these four sections and these exact headings",
+        Mode::Class => "as study notes organised by topic, with exactly this structure and these exact headings",
+    };
     format!(
-        "Write the notes in {lang}, with exactly these four sections and these exact headings:\n{body} \
-         Add nothing before or after the sections.",
+        "Write the notes in {lang}, {intro}:\n{body} Add nothing before or after the sections.",
         lang = s.language,
     )
 }
@@ -444,8 +472,9 @@ impl Llm {
                     Mode::Meeting => ("meeting", "the key points, decisions and action items (with owners)"),
                     Mode::Class => (
                         "class",
-                        "the topics, every concept with its definition, the formulas and examples, \
-                         and the tasks with their due dates",
+                        "grouped by topic: the concepts with their definitions, the examples, formulas, \
+                         contrasts between things, what the teacher stressed, the tasks with their due \
+                         dates, and any unclear passages",
                     ),
                 };
                 let prompt = format!(
@@ -853,19 +882,29 @@ mod tests {
     #[test]
     fn class_sections_in_both_languages() {
         let en = sections("en", Mode::Class);
-        assert_eq!(en.headings, ["Topics covered", "Key concepts and definitions", "Formulas or examples", "Tasks and due dates"]);
+        assert_eq!(en.headings, ["In short", "Key takeaways", "Tasks and due dates", "To double-check"]);
         let p = format(en);
-        for h in en.headings {
-            assert!(p.contains(&format!("## {h}\n")), "{h}");
+        for h in ["## In short\n", "## Key takeaways\n", "## 1. <Topic name>\n", "## 2. <Next topic>\n", "## Tasks and due dates\n", "## To double-check\n", "**Core idea:**", "> **Note:**"] {
+            assert!(p.contains(h), "{h}");
         }
-        assert_eq!(p.matches("\n## ").count(), 4);
         assert!(p.contains("- [ ] Owner does the task · due"), "class tasks reuse the task format");
-        assert!(!p.contains("Decisions") && !p.contains("Open questions"));
+        assert!(!p.contains("Decisions") && !p.contains("Open questions") && !p.contains("Topics covered"));
 
         let es = sections("es", Mode::Class);
-        assert_eq!(es.headings[3], "Tareas y fechas de entrega");
+        assert_eq!(es.headings, ["En resumen", "Ideas clave", "Tareas y entregas", "Dudas para revisar"]);
         let p = format(es);
-        assert!(p.contains("in Spanish") && p.contains("## Temas vistos") && !p.contains("## Topics covered"));
+        for h in ["## En resumen\n", "## Ideas clave\n", "## 1. <Topic name>\n", "## Tareas y entregas\n", "## Dudas para revisar\n", "**Idea central:**", "> **Ojo:**"] {
+            assert!(p.contains(h), "{h}");
+        }
+        assert!(p.contains("in Spanish") && !p.contains("## In short") && !p.contains("Temas vistos"));
+    }
+
+    #[test]
+    fn meeting_prompt_has_no_class_structure() {
+        for lang in ["es", "en"] {
+            let p = format(sections(lang, Mode::Meeting));
+            assert!(p.contains("exactly these four sections") && !p.contains("study notes") && !p.contains("<Topic name>"));
+        }
     }
 
     #[test]
