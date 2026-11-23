@@ -551,29 +551,33 @@ pub fn strip_markdown(line: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The non-empty lines of the sections of `summary`, each with its lowercased heading (without
+/// `#` or `**`). Text before the first heading is a section with the heading "".
+fn summary_sections(summary: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = vec![(String::new(), Vec::new())];
+    for raw in summary.lines() {
+        let l = raw.trim();
+        if l.starts_with('#') {
+            out.push((l.trim_start_matches('#').replace("**", "").trim().to_lowercase(), Vec::new()));
+        } else if !l.is_empty() {
+            out.last_mut().unwrap().1.push(l.to_string());
+        }
+    }
+    out.retain(|(h, lines)| !h.is_empty() || !lines.is_empty());
+    out
+}
+
 /// Up to `max` short lines that say what a session is about, for the sheets of a notebook:
-/// the bullets of the first section of the summary (Topics covered, Key points…) or, without
-/// a summary, the start of the notes, or of the transcript. Markdown is stripped.
+/// the bullets of the "Ideas clave" / "Key takeaways" section of a class summary, else those of
+/// the first section (Key points…) or, without a summary, the start of the notes, or of the transcript. Markdown is stripped.
 pub fn preview_lines(m: &Meeting, max: usize) -> Vec<String> {
     let clean = |lines: Vec<String>| -> Vec<String> { lines.into_iter().map(|l| strip_markdown(&l)).filter(|l| !l.is_empty()).take(max).collect() };
     if !m.summary.trim().is_empty() {
-        let mut section: Vec<String> = Vec::new();
-        let mut started = false;
-        for raw in m.summary.lines() {
-            let l = raw.trim();
-            if l.starts_with('#') {
-                if started {
-                    break;
-                }
-                started = true;
-                continue;
-            }
-            started = true;
-            if !l.is_empty() {
-                section.push(l.to_string());
-            }
-        }
-        let bullets: Vec<String> = section.iter().filter(|l| l.starts_with("- ") || l.starts_with("* ")).cloned().collect();
+        let is_bullet = |l: &str| l.starts_with("- ") || l.starts_with("* ");
+        let sections = summary_sections(&m.summary);
+        let takeaways = sections.iter().find(|(h, lines)| matches!(h.as_str(), "ideas clave" | "key takeaways") && lines.iter().any(|l| is_bullet(l)));
+        let section = takeaways.or(sections.first()).map(|(_, lines)| lines.clone()).unwrap_or_default();
+        let bullets: Vec<String> = section.iter().filter(|l| is_bullet(l)).cloned().collect();
         let got = clean(if bullets.is_empty() { section } else { bullets });
         if !got.is_empty() {
             return got;
@@ -1104,6 +1108,20 @@ mod tests {
         // Without bullets the prose of the section is used.
         let prose = nb_session("P", "2026-11-18 09:00", "## Summary\nWe agreed on the plan.\nShip on Friday.");
         assert_eq!(preview_lines(&prose, 4), ["We agreed on the plan.", "Ship on Friday."]);
+    }
+
+    #[test]
+    fn the_preview_of_a_class_summary_is_its_key_takeaways() {
+        let new = "## En resumen\nUna clase sobre limites.\n\n## Ideas clave\n- El limite es un valor.\n- Continuidad.\n\n## 1. Limites\n- **Limite**: x";
+        assert_eq!(preview_lines(&nb_session("L", "2026-11-18 09:00", new), 5), ["El limite es un valor.", "Continuidad."]);
+        let en = "## In short\nAbout limits.\n## Key takeaways\n- A limit is a value.\n## 1. Limits\n- x";
+        assert_eq!(preview_lines(&nb_session("L", "2026-11-18 09:00", en), 5), ["A limit is a value."]);
+        // Takeaways without bullets: the first section's prose, never empty.
+        let odd = "## In short\nAbout limits.\n## Key takeaways\nPlain words.";
+        assert_eq!(preview_lines(&nb_session("L", "2026-11-18 09:00", odd), 5), ["About limits."]);
+        // Old summaries keep the first section.
+        let old = "## Topics covered\n- Limits.\n## Key concepts\n- x";
+        assert_eq!(preview_lines(&nb_session("L", "2026-11-18 09:00", old), 5), ["Limits."]);
     }
 
     #[test]
