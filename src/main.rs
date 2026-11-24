@@ -15,6 +15,7 @@ mod segmenter;
 mod session;
 mod store;
 mod ui;
+mod update;
 mod vad;
 
 use config::Config;

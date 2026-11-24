@@ -14,6 +14,7 @@ use crate::export;
 use crate::llm::{self, Llm, Scope, clock};
 use crate::session::{Event, Line, Recording};
 use crate::store::{self, Card, Meeting, Mode, Turn};
+use crate::update::{self, Version};
 use rune::tok::TextStyle;
 use rune::{
     Align, App, AppSpec, Color, Cx, El, Icon, Live, OverlayHandle, OverlaySpec, ScreenEdge, ScrollSpec, TextEdit, Tx,
@@ -215,6 +216,52 @@ enum DlMsg {
     Done(Fetch, Result<String, String>),
 }
 
+/// Where an update stands, once the notice's "Update" was pressed.
+enum Upgrade {
+    Idle,
+    Downloading { version: Version, have: u64, total: u64 },
+    /// The new binary is in place; it runs after a restart.
+    Ready(Version),
+    Failed(Version, String),
+}
+
+enum UpMsg {
+    /// A check ended; `explicit` is "Check now", which reports errors.
+    Checked { explicit: bool, result: Result<Version, String> },
+    Progress(u64, u64),
+    Done(Version, Result<(), String>),
+}
+
+/// Everything about updates (see `update`).
+struct Updates {
+    /// What was found by the last good check, and whether its notice was dismissed.
+    state: update::State,
+    /// The binary to replace, or why this copy can't update itself. Resolved once, at startup.
+    target: Result<PathBuf, String>,
+    phase: Upgrade,
+    checking: bool,
+    /// The outcome of the last "Check now", and whether it is an error.
+    note: Option<(String, bool)>,
+    /// Whether recording or other work is on (read by the installer right before the swap).
+    blocked: Arc<AtomicBool>,
+    /// "Restart" was pressed; `poll` relaunches.
+    restart: bool,
+}
+
+impl Updates {
+    fn new() -> Updates {
+        Updates {
+            state: update::State::load(),
+            target: update::install_target(),
+            phase: Upgrade::Idle,
+            checking: false,
+            note: None,
+            blocked: Arc::new(AtomicBool::new(false)),
+            restart: false,
+        }
+    }
+}
+
 struct Meters {
     me: Vec<Live<Color>>,
     them: Vec<Live<Color>>,
@@ -269,6 +316,8 @@ pub struct Ui {
     unseen: HashSet<PathBuf>,
     /// Meetings whose transcription or summary failed.
     warned: HashSet<PathBuf>,
+    /// Sessions whose last save failed: their edits live only in memory until a save works.
+    unsaved: HashSet<PathBuf>,
     search: Option<TextEdit>,
     /// When the open meeting changed without being saved yet.
     dirty: Option<f64>,
@@ -296,6 +345,8 @@ pub struct Ui {
     notebook_input: Option<TextEdit>,
     /// The footer message of the last export and the folder it went to, for "Open folder".
     exported: Option<(String, PathBuf)>,
+    updates: Updates,
+    up: (Sender<UpMsg>, Receiver<UpMsg>),
 }
 
 impl Ui {
@@ -328,6 +379,7 @@ impl Ui {
             status: None,
             unseen: HashSet::new(),
             warned: HashSet::new(),
+            unsaved: HashSet::new(),
             search: None,
             dirty: None,
             subject_touched: false,
@@ -344,6 +396,8 @@ impl Ui {
             closed: HashSet::new(),
             notebook_input: None,
             exported: None,
+            updates: Updates::new(),
+            up: mpsc::channel(),
         };
         if let Some(m) = ui.current() {
             ui.view = default_view(m);
@@ -452,6 +506,114 @@ impl Ui {
         });
     }
 
+    /// Why the app must not install or restart now: it would interrupt or lose work.
+    fn update_blocker(&self) -> Option<&'static str> {
+        if !matches!(self.rec, Rec::Idle) {
+            Some("Stop the recording first")
+        } else if self.summarizing.is_some() || self.reviewing.is_some() || self.asking.is_some() {
+            Some("Wait for the summary or answer to finish")
+        } else if self.download.is_some() {
+            Some("Wait for the download to finish")
+        } else {
+            None
+        }
+    }
+
+    fn save_update_state(&mut self) {
+        if !self.demo {
+            let _ = self.updates.state.save();
+        }
+    }
+
+    /// Asks GitHub for the latest release in the background. At startup (`explicit` false) it
+    /// only happens when the setting is on and the last good check is a day old, and failures
+    /// are silent; "Check now" always asks and says what happened.
+    fn check_for_updates(&mut self, explicit: bool) {
+        if self.demo || self.updates.checking {
+            return;
+        }
+        if !explicit && !(self.config.check_updates && self.updates.state.due(update::now())) {
+            return;
+        }
+        self.updates.checking = true;
+        self.updates.note = None;
+        let (tx, wake) = (self.up.0.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(UpMsg::Checked { explicit, result: update::check_latest() });
+            wake();
+        });
+    }
+
+    /// Downloads, checks and installs `version` in the background.
+    fn begin_update(&mut self, version: Version) {
+        if self.demo || self.update_blocker().is_some() || matches!(self.updates.phase, Upgrade::Downloading { .. } | Upgrade::Ready(_)) {
+            return;
+        }
+        let Ok(target) = self.updates.target.clone() else { return };
+        self.updates.phase = Upgrade::Downloading { version, have: 0, total: 0 };
+        let (tx, wake, blocked) = (self.up.0.clone(), self.wake.clone(), self.updates.blocked.clone());
+        std::thread::spawn(move || {
+            let progress = |have, total| {
+                let _ = tx.send(UpMsg::Progress(have, total));
+                wake();
+            };
+            let result = update::install(version, &target, progress, &|| !blocked.load(Ordering::Relaxed));
+            let _ = tx.send(UpMsg::Done(version, result));
+            wake();
+        });
+    }
+
+    fn dismiss_update(&mut self) {
+        self.updates.state.dismissed = self.updates.state.available.clone();
+        self.updates.phase = Upgrade::Idle;
+        self.save_update_state();
+    }
+
+    fn open_releases(&mut self) {
+        if let Err(e) = std::process::Command::new("xdg-open").arg(update::RELEASES_URL).spawn() {
+            self.warn(format!("Could not open the browser: {e}"));
+        }
+    }
+
+    /// Saves what is pending and replaces this process with the new binary (same arguments,
+    /// environment and folder), so a service manager sees one process that never exits. It only
+    /// returns when the restart was refused or `exec` failed; the reason is in the footer.
+    fn relaunch(&mut self) {
+        if self.demo || !matches!(self.updates.phase, Upgrade::Ready(_)) {
+            return;
+        }
+        if let Some(reason) = self.update_blocker() {
+            self.warn(format!("Can't restart now: {}.", reason.to_lowercase()));
+            return;
+        }
+        let Ok(target) = self.updates.target.clone() else { return };
+        if let Some(i) = self.selected {
+            self.meetings[i].notes = self.notes.text.clone();
+        }
+        self.status = None;
+        self.save_current();
+        self.retry_unsaved();
+        if self.status.is_some() || !self.unsaved.is_empty() {
+            return; // something did not save: stay, and show why
+        }
+        use std::os::unix::process::CommandExt;
+        let e = std::process::Command::new(&target).args(std::env::args_os().skip(1)).exec();
+        self.warn(format!("Could not start the new version: {e}"));
+    }
+
+    /// Tries again the sessions whose save failed earlier; forgets those that no longer exist.
+    fn retry_unsaved(&mut self) {
+        let files: Vec<PathBuf> = self.unsaved.iter().cloned().collect();
+        for file in files {
+            match self.index_of(&file) {
+                Some(i) => self.save(i),
+                None => {
+                    self.unsaved.remove(&file);
+                }
+            }
+        }
+    }
+
     fn index_of(&self, file: &Path) -> Option<usize> {
         self.meetings.iter().position(|m| m.file == file)
     }
@@ -488,8 +650,16 @@ impl Ui {
             return;
         }
         if let Some(m) = self.meetings.get(i) {
-            if let Err(e) = m.save() {
-                self.warn(format!("Could not save the session: {e}"));
+            match m.save() {
+                Ok(()) => {
+                    let file = m.file.clone();
+                    self.unsaved.remove(&file);
+                }
+                Err(e) => {
+                    let file = m.file.clone();
+                    self.unsaved.insert(file);
+                    self.warn(format!("Could not save the session: {e}"));
+                }
             }
         }
     }
@@ -525,6 +695,7 @@ impl Ui {
         let notes_dir = self.config.notes_dir.clone();
         match self.meetings[i].relocate(&notes_dir, &taken) {
             Ok(Some(old)) => {
+                self.unsaved.remove(&old);
                 let new = self.meetings[i].file.clone();
                 if self.unseen.remove(&old) {
                     self.unseen.insert(new.clone());
@@ -635,7 +806,8 @@ impl Ui {
         self.start_recording();
         if matches!(self.rec, Rec::Idle) {
             // Recording could not start: don't leave an empty meeting behind.
-            self.meetings.remove(0);
+            let gone = self.meetings.remove(0);
+            self.unsaved.remove(&gone.file);
             self.selected = None;
         }
     }
@@ -986,6 +1158,44 @@ impl Ui {
                 }
             }
         }
+        while let Ok(msg) = self.up.1.try_recv() {
+            changed = true;
+            match msg {
+                UpMsg::Checked { explicit, result } => {
+                    self.updates.checking = false;
+                    match result {
+                        Ok(latest) => {
+                            let current = Version::current();
+                            self.updates.state.record(latest, current, update::now());
+                            if explicit {
+                                self.updates.state.dismissed = None;
+                                self.updates.note = Some(if latest > current {
+                                    (format!("Hushnote {latest} is available."), false)
+                                } else {
+                                    ("You're up to date.".to_string(), false)
+                                });
+                            }
+                            self.save_update_state();
+                        }
+                        Err(e) if explicit => self.updates.note = Some((e, true)),
+                        Err(_) => {}
+                    }
+                }
+                UpMsg::Progress(h, t) => {
+                    if let Upgrade::Downloading { have, total, .. } = &mut self.updates.phase {
+                        (*have, *total) = (h, t);
+                    }
+                }
+                UpMsg::Done(version, result) => match result {
+                    Ok(()) => {
+                        self.updates.phase = Upgrade::Ready(version);
+                        self.updates.state.available = None;
+                        self.save_update_state();
+                    }
+                    Err(e) => self.updates.phase = Upgrade::Failed(version, e),
+                },
+            }
+        }
         while let Ok(msg) = self.dl.1.try_recv() {
             changed = true;
             match msg {
@@ -1152,11 +1362,17 @@ fn default_view(m: &Meeting) -> View {
 fn setup(s: &mut Ui, waker: Waker) {
     s.wake = waker;
     s.check_llm();
+    s.check_for_updates(false);
 }
 
 fn poll(s: &mut Ui, t: f64, tx: &mut Tx) -> bool {
     s.now = t;
     let mut changed = s.drain();
+    s.updates.blocked.store(s.update_blocker().is_some(), Ordering::Relaxed);
+    if std::mem::take(&mut s.updates.restart) {
+        s.relaunch();
+        changed = true;
+    }
     s.retry_relocations();
     if let Some(since) = s.dirty {
         if t - since >= AUTOSAVE_S && !matches!(s.rec, Rec::Live { .. }) {
@@ -1350,6 +1566,7 @@ fn sidebar(s: &Ui) -> El {
         .gap(22.0)
         .child(nav)
         .child(list.scroll(ScrollSpec { stick_bottom: false }).grow(1.0).min_h(0.0))
+        .children(update_notice(s))
 }
 
 /// A notebook's heading: a chevron that opens and closes it, the name (opens the cover, and
@@ -2192,6 +2409,15 @@ fn home_view(s: &Ui) -> El {
         }
         c = c.child(col().w_full().pt(22.0).gap(16.0).child(text("NOTEBOOKS").font(mono(11.5)).color(P::dim())).child(grid));
     }
+    c = c.child(
+        col()
+            .key("updates")
+            .w_full()
+            .pt(if books { 22.0 } else { 18.0 })
+            .gap(8.0)
+            .child(text("UPDATES").font(mono(11.5)).color(P::dim()).pb(2.0))
+            .child(update_row(s)),
+    );
     column_of("home", c, false, if books { COLUMN_WIDE } else { COLUMN })
 }
 
@@ -2479,6 +2705,130 @@ fn download_progress(d: &Download, width: f32) -> El {
         )
         .child(text(label).font(mono(12.5)).color(P::secondary()))
         .child(chip_button("cancel-download", "Cancel".into(), false, |s: &mut Ui| s.cancel_download()))
+}
+
+/// The sidebar's notice: a new version is out (Update, Later), it is installing, it is ready
+/// (Restart) or it failed (Retry). `None` when there is nothing to say.
+fn update_notice(s: &Ui) -> Option<El> {
+    let u = &s.updates;
+    let blocker = s.update_blocker();
+    let width = 214.0;
+    let card = |title: String, detail: Option<(String, bool)>, bar: Option<El>, buttons: El| {
+        let mut c = col()
+            .key("update-notice")
+            .w_full()
+            .px(12.0)
+            .py(10.0)
+            .gap(8.0)
+            .radius(9.0)
+            .fill(P::raised())
+            .border(1.0, P::line())
+            .child(row().gap(8.0).center_y().child(dot(P::accent())).child(text(title).font(sans(13.5, 500.0)).color(P::text()).wrap().min_w(0.0)));
+        if let Some((msg, warn)) = detail {
+            c = c.child(text(msg).font(sans(12.5, 400.0)).color(if warn { P::warn() } else { P::secondary() }).wrap());
+        }
+        if let Some(bar) = bar {
+            c = c.child(bar);
+        }
+        c.child(buttons)
+    };
+    let buttons = || row().gap(6.0).center_y();
+    let primary = |key: &str, label: &str, on: fn(&mut Ui)| match blocker {
+        Some(reason) => disabled_button(key, label, reason),
+        None => plain_button(key, label, on),
+    };
+    let reason = blocker.map(|r| (r.to_string(), false));
+    Some(match &u.phase {
+        Upgrade::Downloading { version, have, total } => {
+            let frac = if *total > 0 { (*have as f32 / *total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let label = if *total > 0 && have >= total { "Installing…".to_string() } else if *total > 0 {
+                format!("{} / {}", models::megabytes(*have), models::megabytes(*total))
+            } else {
+                "Starting…".to_string()
+            };
+            let bar = el().key("update-progress").w(width).h(4.0).radius(2.0).fill(P::line()).child(el().w(width * frac).h(4.0).radius(2.0).fill(P::accent()));
+            card(format!("Updating to {version}"), Some((label, false)), Some(bar), buttons())
+        }
+        Upgrade::Ready(version) => card(
+            format!("Hushnote {version} is installed"),
+            Some((reason.map_or("Restart to finish updating.".to_string(), |r| r.0), false)),
+            None,
+            buttons().child(primary("update-restart", "Restart", |s: &mut Ui| {
+                s.updates.restart = true;
+                (s.wake)();
+            })),
+        ),
+        Upgrade::Failed(version, msg) => {
+            let version = *version;
+            card(
+                format!("Couldn't update to {version}"),
+                Some((msg.clone(), true)),
+                None,
+                buttons()
+                    .child(primary("update-retry", "Retry", |s: &mut Ui| {
+                        if let Some(v) = s.updates.state.available(Version::current()) {
+                            s.updates.phase = Upgrade::Idle;
+                            s.begin_update(v);
+                        }
+                    }))
+                    .child(chip_button("update-dismiss", "Dismiss".into(), false, |s: &mut Ui| s.dismiss_update())),
+            )
+        }
+        Upgrade::Idle => {
+            let version = u.state.notice(Version::current())?;
+            let later = chip_button("update-later", "Later".into(), false, |s: &mut Ui| s.dismiss_update());
+            match &u.target {
+                Ok(_) => card(
+                    format!("Hushnote {version} is available"),
+                    reason,
+                    None,
+                    buttons()
+                        .child(primary("update-install", "Update", |s: &mut Ui| {
+                            if let Some(v) = s.updates.state.available(Version::current()) {
+                                s.begin_update(v);
+                            }
+                        }))
+                        .child(later),
+                ),
+                Err(why) => card(
+                    format!("Hushnote {version} is available"),
+                    Some((format!("This copy can't update itself ({why}). Install it from the releases page."), false)),
+                    None,
+                    buttons().child(plain_button("update-releases", "Releases page", |s: &mut Ui| s.open_releases())).child(later),
+                ),
+            }
+        }
+    })
+}
+
+/// Home's "Updates" row: the version, the automatic check and "Check now".
+fn update_row(s: &Ui) -> El {
+    let u = &s.updates;
+    let detail = match (&u.note, u.checking) {
+        (Some((msg, _)), _) => msg.clone(),
+        (None, true) => "Checking…".to_string(),
+        _ => match u.state.available(Version::current()) {
+            Some(v) => format!("Hushnote {v} is available."),
+            None if s.config.check_updates => "Looks for a new version on GitHub once a day.".to_string(),
+            None => "Automatic checks are off.".to_string(),
+        },
+    };
+    let busy = u.checking || matches!(u.phase, Upgrade::Downloading { .. });
+    let check = if busy {
+        disabled_button("update-check", "Check now", "Busy")
+    } else {
+        plain_button("update-check", "Check now", |s: &mut Ui| s.check_for_updates(true))
+    };
+    let toggle = chip_button(
+        "update-auto",
+        format!("Check automatically · {}", if s.config.check_updates { "On" } else { "Off" }),
+        false,
+        |s: &mut Ui| {
+            s.config.check_updates = !s.config.check_updates;
+            s.save_config();
+        },
+    );
+    setup_row("update-row", format!("Hushnote {}", update::VERSION), detail, row().gap(6.0).center_y().child(toggle).child(check))
 }
 
 fn setup_row(key: &str, title: String, detail: String, right: El) -> El {
@@ -2855,6 +3205,41 @@ fn scene_setup(s: &mut Ui) {
     s.download = Some(Download { what: Fetch::Speech, have: 312_000_000, total: models::PARAKEET_V3.bytes, cancel: Arc::new(AtomicBool::new(false)) });
 }
 
+/// A newer release is known: the notice in the sidebar and the Updates row on Home.
+fn scene_update(s: &mut Ui) {
+    scene_home(s);
+    s.updates.state = update::State { checked_at: 1, available: Some("0.2.2".into()), dismissed: None };
+    s.updates.target = Ok(PathBuf::from("/home/me/.local/bin/hushnote"));
+}
+
+fn scene_updating(s: &mut Ui) {
+    scene_update(s);
+    s.updates.phase = Upgrade::Downloading { version: Version(0, 2, 2), have: 9_300_000, total: 17_700_000 };
+}
+
+fn scene_updated(s: &mut Ui) {
+    scene_update(s);
+    s.updates.phase = Upgrade::Ready(Version(0, 2, 2));
+}
+
+fn scene_update_failed(s: &mut Ui) {
+    scene_update(s);
+    s.updates.phase = Upgrade::Failed(Version(0, 2, 2), "The update didn't match its checksum, so it was not installed.".into());
+}
+
+fn scene_update_busy(s: &mut Ui) {
+    scene_update(s);
+    scene_recording(s);
+    s.updates.state = update::State { checked_at: 1, available: Some("0.2.2".into()), dismissed: None };
+    s.updates.target = Ok(PathBuf::from("/home/me/.local/bin/hushnote"));
+}
+
+fn scene_update_manual(s: &mut Ui) {
+    scene_update(s);
+    s.updates.target = Err("this is a development build".into());
+    s.updates.note = Some(("You're up to date.".into(), false));
+}
+
 fn scene_empty(s: &mut Ui) {
     s.demo = true;
     s.config = Config::default();
@@ -2888,6 +3273,12 @@ pub fn run(args: Vec<String>) {
             ("notebook-review", scene_notebook_review),
             ("empty", scene_empty),
             ("setup", scene_setup),
+            ("update", scene_update),
+            ("updating", scene_updating),
+            ("updated", scene_updated),
+            ("update-failed", scene_update_failed),
+            ("update-busy", scene_update_busy),
+            ("update-manual", scene_update_manual),
         ],
         ..AppSpec::new("Hushnote", (1280.0, 840.0), || Ui::new(None), view)
     };
@@ -2908,6 +3299,35 @@ mod tests {
         assert!(matches!(&p[1], Piece::Task { line: 4, done: false, text, due: Some(d) } if text == "Dani fixes the bug" && d == "Thu"));
         assert!(matches!(&p[2], Piece::Task { done: true, due: None, .. }));
         assert!(matches!(&p[3], Piece::Md(s) if s.contains("Open questions")));
+    }
+
+    #[test]
+    fn restart_waits_for_sessions_whose_save_failed() {
+        let dir = std::env::temp_dir().join(format!("hushnote-test-unsaved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "a file where a folder should be").unwrap();
+        let mut ui = Ui::new(None);
+        ui.meetings = vec![Meeting::new(&dir, Mode::Meeting)];
+        ui.meetings[0].file = blocker.join("a.md");
+        ui.meetings[0].title = "Edited".into();
+        ui.selected = None; // Home: nothing selected, so a plain save of "the open one" skips it
+        ui.save(0);
+        assert!(ui.unsaved.contains(&blocker.join("a.md")));
+        ui.updates.phase = Upgrade::Ready(Version::current());
+        ui.updates.target = Ok(dir.join("missing").join("hushnote"));
+        ui.relaunch();
+        assert!(ui.status.as_ref().is_some_and(|s| s.1), "the error is shown");
+        assert!(!ui.unsaved.is_empty(), "refused to restart with edits that are not on disk");
+        // Once the disk works again, the retry saves it and the restart goes on (here `exec` fails
+        // on the missing binary, which leaves the app running).
+        std::fs::remove_file(&blocker).unwrap();
+        ui.relaunch();
+        assert!(ui.unsaved.is_empty());
+        assert!(std::fs::read_to_string(blocker.join("a.md")).unwrap().contains("Edited"));
+        assert!(ui.status.as_ref().unwrap().0.contains("Could not start the new version"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3112,6 +3532,55 @@ mod tests {
         assert!(ui.meetings[0].summary.contains("- [x] Dani fixes the sign-up bug · Thu"));
         ui.toggle_task(0, line);
         assert!(ui.meetings[0].summary.contains("- [ ] Dani fixes the sign-up bug · Thu"));
+    }
+
+    #[test]
+    fn updates_wait_while_recording_or_summarizing_or_downloading() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        assert_eq!(ui.update_blocker(), None);
+        ui.rec = Rec::Live { handle: None, t0: 0.0, offset_ms: 0, file: PathBuf::from("/x.md") };
+        assert!(ui.update_blocker().is_some());
+        ui.rec = Rec::Finishing { offset_ms: 0, end_ms: 0, file: PathBuf::from("/x.md") };
+        assert!(ui.update_blocker().is_some());
+        ui.rec = Rec::Idle;
+        ui.summarizing = Some(PathBuf::from("/x.md"));
+        assert!(ui.update_blocker().is_some());
+        ui.summarizing = None;
+        ui.download = Some(Download { what: Fetch::Llm, have: 0, total: 0, cancel: Arc::new(AtomicBool::new(false)) });
+        assert!(ui.update_blocker().is_some());
+    }
+
+    #[test]
+    fn the_update_notice_can_be_dismissed_and_never_starts_while_blocked() {
+        let mut ui = Ui::new(None);
+        ui.demo = true; // nothing is written or downloaded
+        ui.updates.state = update::State { checked_at: 1, available: Some("99.0.0".into()), dismissed: None };
+        assert!(update_notice(&ui).is_some());
+        ui.rec = Rec::Live { handle: None, t0: 0.0, offset_ms: 0, file: PathBuf::from("/x.md") };
+        ui.begin_update(Version(99, 0, 0));
+        assert!(matches!(ui.updates.phase, Upgrade::Idle));
+        ui.rec = Rec::Idle;
+        ui.dismiss_update();
+        assert!(update_notice(&ui).is_none());
+        ui.updates.state.available = Some("99.0.1".into());
+        assert!(update_notice(&ui).is_some(), "a newer version is announced again");
+    }
+
+    #[test]
+    fn no_update_check_runs_in_demo_mode_or_when_off_or_when_not_due() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        ui.check_for_updates(true);
+        assert!(!ui.updates.checking);
+        ui.demo = false;
+        ui.config.check_updates = false;
+        ui.check_for_updates(false);
+        assert!(!ui.updates.checking, "off");
+        ui.config.check_updates = true;
+        ui.updates.state.checked_at = update::now();
+        ui.check_for_updates(false);
+        assert!(!ui.updates.checking, "checked less than a day ago");
     }
 
     /// The whole recording path through the window's state, in real time: New meeting starts

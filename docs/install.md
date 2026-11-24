@@ -16,6 +16,14 @@ download the speech model from Home › Set up.
 From a clone of the repository, `scripts/install.sh` does the same and builds the app first if
 needed.
 
+## Update
+
+Hushnote looks for a new release on GitHub once a day (turn it off in Home › Updates). When
+there is one, the sidebar shows **Update**: it downloads the release, checks its sha256, and replaces `~/.local/bin/hushnote`; press **Restart** to run it. It
+waits while you record or a summary is being written. A copy that isn't installed (a build in
+`target/`, or a folder you can't write to) shows a link to the releases page instead. You can
+always update by hand by running the new release's `install.sh`.
+
 ## What gets installed, and where
 
 | What | Where | Removed by |
