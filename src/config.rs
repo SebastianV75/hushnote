@@ -33,6 +33,8 @@ pub struct Config {
     pub notes_dir: PathBuf,
     /// Also capture the system audio (what the other people say).
     pub system_audio: bool,
+    /// Look for a newer release on GitHub once a day.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("Hushnote"),
             system_audio: true,
+            check_updates: true,
         }
     }
 }

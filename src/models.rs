@@ -139,7 +139,7 @@ pub fn for_path(path: &std::path::Path) -> Option<&'static Artifact> {
     SPEECH.iter().find(|a| a.file == file)
 }
 
-fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+pub fn sha256_file(path: &std::path::Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
