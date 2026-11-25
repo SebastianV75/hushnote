@@ -109,6 +109,10 @@ static CHECK: Icon = Icon {
 
 const METER_BARS: usize = 5;
 const AUTOSAVE_S: f64 = 2.0;
+/// While capturing, the dirty sessions are written this often instead of [`AUTOSAVE_S`] (lines
+/// arrive constantly). A crash loses up to this interval plus the phrase still being spoken and
+/// whatever is queued for transcription.
+const REC_AUTOSAVE_S: f64 = 15.0;
 const COLUMN: f32 = 720.0;
 /// The column of Home and of a notebook cover: four cards of [`CARD_W`] across.
 const COLUMN_WIDE: f32 = 960.0;
@@ -664,7 +668,19 @@ impl Ui {
         }
     }
 
+    /// Writes the open session, and the one being recorded when it is another one. While live,
+    /// the written `duration_ms` is the elapsed time so far (absolute: it already includes the
+    /// offset), so a crashed recording reopens with a sensible length and resuming does not
+    /// overlap; `stop_recording` writes the same absolute value.
     fn save_current(&mut self) {
+        if let Some(r) = self.rec_file().and_then(|f| self.index_of(f)) {
+            if matches!(self.rec, Rec::Live { .. }) {
+                self.meetings[r].duration_ms = self.elapsed_ms();
+            }
+            if self.selected != Some(r) {
+                self.save(r);
+            }
+        }
         if let Some(i) = self.selected {
             self.save(i);
             if std::mem::take(&mut self.subject_touched) {
@@ -673,6 +689,33 @@ impl Ui {
             }
         }
         self.dirty = None;
+    }
+
+    /// Saves what changed once it has waited long enough (longer while recording). Returns how
+    /// long to wait before calling again, when something is still pending. A failed save is
+    /// tried again after another interval, and warns only the first time.
+    fn autosave(&mut self, t: f64) -> Option<f64> {
+        let since = self.dirty?;
+        let wait = if matches!(self.rec, Rec::Live { .. }) { REC_AUTOSAVE_S } else { AUTOSAVE_S };
+        if t - since < wait {
+            return Some(wait - (t - since));
+        }
+        let (before, status) = (self.unsaved.clone(), self.status.clone());
+        self.save_current();
+        self.retry_unsaved(); // so a session that failed earlier does not keep this one dirty
+        if !self.unsaved.is_empty() {
+            self.dirty = Some(t);
+            // The same save failure again: do not bring back a warning the user dismissed.
+            // Any other message (a failed move, a different error) is shown.
+            let repeat = self.unsaved == before
+                && self.status.as_ref().is_some_and(|s| s.0.starts_with("Could not save the session"))
+                && status.as_ref().is_none_or(|s| Some(s) == self.status.as_ref());
+            if repeat {
+                self.status = status;
+            }
+            return Some(wait);
+        }
+        None
     }
 
     /// Moves the session at `file` to its ideal path (subject folder, readable name), or marks
@@ -1374,12 +1417,8 @@ fn poll(s: &mut Ui, t: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     s.retry_relocations();
-    if let Some(since) = s.dirty {
-        if t - since >= AUTOSAVE_S && !matches!(s.rec, Rec::Live { .. }) {
-            s.save_current();
-        } else {
-            tx.wake_after(Duration::from_secs_f64(AUTOSAVE_S));
-        }
+    if let Some(wait) = s.autosave(t) {
+        tx.wake_after(Duration::from_secs_f64(wait));
     }
     if matches!(s.rec, Rec::Live { .. }) {
         // The clock ticks once a second; the meters move on their own through `Live`.
@@ -3581,6 +3620,185 @@ mod tests {
         ui.updates.state.checked_at = update::now();
         ui.check_for_updates(false);
         assert!(!ui.updates.checking, "checked less than a day ago");
+    }
+
+    /// A window recording into `meetings[0]` (selected), with `meetings[1]` beside it, in `dir`.
+    fn recording_ui(name: &str) -> (Ui, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hushnote-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ui = Ui::new(None);
+        ui.config.notes_dir = dir.clone();
+        let mut a = Meeting::new(&dir, Mode::Meeting);
+        a.file = dir.join("a.md");
+        a.duration_ms = 60_000; // the stretch before this recording, like `offset_ms`
+        let mut b = Meeting::new(&dir, Mode::Meeting);
+        b.file = dir.join("b.md");
+        b.title = "Other".into();
+        ui.meetings = vec![a, b];
+        ui.selected = Some(0);
+        ui.rec = Rec::Live { handle: None, t0: 0.0, offset_ms: 60_000, file: dir.join("a.md") };
+        (ui, dir)
+    }
+
+    fn hear(ui: &mut Ui, text: &str) {
+        let line = Line { speaker: Speaker::Me, t_ms: 1_000, text: text.into() };
+        ui.events.0.send(Event::Line(line)).unwrap();
+        ui.drain();
+    }
+
+    #[test]
+    fn lines_heard_while_recording_reach_disk_after_the_interval() {
+        let (mut ui, dir) = recording_ui("autosave");
+        ui.now = 100.0;
+        hear(&mut ui, "hello class");
+        assert!(ui.dirty.is_some());
+        assert_eq!(ui.autosave(100.0 + REC_AUTOSAVE_S - 1.0), Some(1.0), "not yet: waits");
+        assert!(!dir.join("a.md").exists());
+        assert_eq!(ui.autosave(100.0 + REC_AUTOSAVE_S), None);
+        assert!(matches!(ui.rec, Rec::Live { .. }), "saving does not stop the recording");
+        let saved = Meeting::load(&dir.join("a.md")).expect("written while live");
+        assert_eq!(saved.lines.len(), 1);
+        assert!(saved.summary.is_empty());
+        assert!(ui.dirty.is_none(), "nothing left to save");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_recorded_session_and_the_open_one_are_both_saved() {
+        let (mut ui, dir) = recording_ui("both");
+        ui.selected = Some(1); // looking at another session while recording into `a`
+        ui.now = 10.0;
+        hear(&mut ui, "still recording");
+        ui.meetings[1].notes = "typed meanwhile".into();
+        assert_eq!(ui.autosave(10.0 + REC_AUTOSAVE_S), None);
+        assert_eq!(Meeting::load(&dir.join("a.md")).unwrap().lines.len(), 1);
+        assert_eq!(Meeting::load(&dir.join("b.md")).unwrap().notes.trim(), "typed meanwhile");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duration_is_saved_live_and_not_counted_twice_on_stop() {
+        let (mut ui, dir) = recording_ui("duration");
+        ui.now = 30.0; // 30 s after the start, on top of the 60 s already recorded
+        hear(&mut ui, "x");
+        assert_eq!(ui.autosave(30.0 + REC_AUTOSAVE_S), None);
+        let after_crash = Meeting::load(&dir.join("a.md")).unwrap();
+        assert_eq!(after_crash.duration_ms, 90_000, "offset plus elapsed, once");
+        ui.now = 45.0;
+        hear(&mut ui, "y");
+        assert_eq!(ui.autosave(45.0 + REC_AUTOSAVE_S), None);
+        assert_eq!(Meeting::load(&dir.join("a.md")).unwrap().duration_ms, 105_000, "absolute, not summed");
+        ui.now = 50.0;
+        ui.stop_recording();
+        assert_eq!(ui.meetings[0].duration_ms, 110_000);
+        assert_eq!(Meeting::load(&dir.join("a.md")).unwrap().duration_ms, 110_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_recorded_file_is_not_moved_while_recording() {
+        let (mut ui, dir) = recording_ui("relocate");
+        ui.meetings[0].subject = "Calculus I".into();
+        ui.subject_touched = true;
+        ui.dirty = Some(0.0);
+        assert_eq!(ui.autosave(REC_AUTOSAVE_S), None);
+        assert!(dir.join("a.md").exists(), "still at its path");
+        assert!(!dir.join("Calculus I").exists());
+        assert!(ui.relocate_pending.contains(&dir.join("a.md")), "the move waits");
+        ui.rec = Rec::Idle;
+        ui.retry_relocations();
+        assert!(!dir.join("a.md").exists() && ui.meetings[0].file.starts_with(dir.join("Calculus I")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_autosave_keeps_recording_and_retries_without_repeating_the_warning() {
+        let (mut ui, dir) = recording_ui("retry");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "a file where a folder should be").unwrap();
+        ui.meetings[0].file = blocker.join("a.md");
+        ui.rec = Rec::Live { handle: None, t0: 0.0, offset_ms: 0, file: blocker.join("a.md") };
+        hear(&mut ui, "x");
+        assert_eq!(ui.autosave(REC_AUTOSAVE_S), Some(REC_AUTOSAVE_S), "tries again after another interval");
+        assert!(matches!(ui.rec, Rec::Live { .. }));
+        assert!(ui.unsaved.contains(&blocker.join("a.md")));
+        assert!(ui.status.as_ref().is_some_and(|s| s.1));
+        ui.status = None; // the user dismissed it: the next failure does not bring it back
+        assert_eq!(ui.autosave(2.0 * REC_AUTOSAVE_S), Some(REC_AUTOSAVE_S));
+        assert!(ui.status.is_none());
+        std::fs::remove_file(&blocker).unwrap();
+        assert_eq!(ui.autosave(3.0 * REC_AUTOSAVE_S), None);
+        assert!(ui.unsaved.is_empty());
+        assert_eq!(Meeting::load(&blocker.join("a.md")).unwrap().lines.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_that_failed_earlier_does_not_keep_the_open_one_saving() {
+        let (mut ui, dir) = recording_ui("loop");
+        ui.rec = Rec::Idle;
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "a file where a folder should be").unwrap();
+        ui.meetings[0].file = blocker.join("a.md");
+        ui.dirty = Some(0.0);
+        assert_eq!(ui.autosave(AUTOSAVE_S), Some(AUTOSAVE_S), "a fails to save");
+        assert!(ui.unsaved.contains(&blocker.join("a.md")));
+        ui.selected = Some(1); // moves on to b while the disk is still broken
+        std::fs::remove_file(&blocker).unwrap(); // and the disk recovers
+        ui.dirty = Some(10.0);
+        assert_eq!(ui.autosave(10.0 + AUTOSAVE_S), None, "settled");
+        assert!(ui.unsaved.is_empty());
+        assert!(ui.dirty.is_none());
+        assert!(Meeting::load(&blocker.join("a.md")).is_some(), "a was saved after all");
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        assert_eq!(ui.autosave(30.0), None);
+        assert!(!dir.join("b.md").exists(), "b is not rewritten every interval");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_repeated_save_failure_is_kept_quiet() {
+        let (mut ui, dir) = recording_ui("quiet");
+        ui.rec = Rec::Idle;
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "a file where a folder should be").unwrap();
+        ui.meetings[0].file = blocker.join("a.md");
+        ui.dirty = Some(0.0);
+        ui.autosave(AUTOSAVE_S);
+        ui.warn("Could not move the session: busy");
+        assert_eq!(ui.autosave(2.0 * AUTOSAVE_S), Some(AUTOSAVE_S));
+        let shown = ui.status.clone().unwrap().0;
+        assert!(shown.starts_with("Could not save the session"), "an unrelated warning is replaced: {shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finishing_saves_at_the_normal_interval_and_keeps_the_stopped_duration() {
+        let (mut ui, dir) = recording_ui("finishing");
+        ui.rec = Rec::Finishing { offset_ms: 60_000, end_ms: 100_000, file: dir.join("a.md") };
+        ui.meetings[0].duration_ms = 100_000; // what `stop_recording` stored
+        ui.now = 500.0; // the clock keeps running; the duration must not follow it
+        ui.dirty = Some(0.0);
+        assert_eq!(ui.autosave(AUTOSAVE_S - 0.5), Some(0.5));
+        assert!(!dir.join("a.md").exists());
+        assert_eq!(ui.autosave(AUTOSAVE_S), None);
+        assert_eq!(Meeting::load(&dir.join("a.md")).unwrap().duration_ms, 100_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poll_saves_while_recording_once_the_interval_has_passed() {
+        let (mut ui, dir) = recording_ui("poll");
+        let mut tx = Tx::default();
+        ui.now = 100.0;
+        hear(&mut ui, "hello");
+        poll(&mut ui, 100.0 + REC_AUTOSAVE_S - 1.0, &mut tx);
+        assert!(!dir.join("a.md").exists());
+        poll(&mut ui, 100.0 + REC_AUTOSAVE_S, &mut tx);
+        assert_eq!(Meeting::load(&dir.join("a.md")).unwrap().lines.len(), 1);
+        assert!(ui.dirty.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole recording path through the window's state, in real time: New meeting starts
