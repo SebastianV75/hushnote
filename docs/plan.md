@@ -47,6 +47,9 @@ on the machine.** Main target: Linux on Omarchy (Hyprland, Wayland, PipeWire).
   (`stream.capture.sink=true`) = "Them". `--raw` only with PipeWire ≥ 1.3.81 (detected through
   `--help`). Each capture runs in its own process group, and stopping kills the whole group, so
   a wrapper's children can't keep the pipe open and stall the transcript.
+- **Screen awake while recording:** the Wayland `idle-inhibit` protocol (`src/inhibit.rs`), held
+  from Record to Stop, so a class with no input is not locked or blanked. logind's `idle`
+  inhibitors are not read by Hyprland. It dies with the process; closing the lid still suspends.
 - **Summaries:** by default a local LLM through an OpenAI-compatible API
   (`/v1/chat/completions`): Ollama, llama-server or LM Studio. Default
   `http://localhost:11434/v1`, model `qwen3:4b-instruct-2507-q4_K_M` (~2.5 GB, ~3–4 GB of RAM

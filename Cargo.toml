@@ -25,6 +25,11 @@ hound = "3.5"
 libc = "0.2"
 sha2 = "0.10"
 
+# Idle inhibit while recording (src/inhibit.rs); both are already in the tree through the window toolkit.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
 [patch.crates-io]
 winit = { git = "https://github.com/anomalyco/rune", rev = "842c28c2ca5dd1506c1e4a67052db61800aed721" }
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "842c28c2ca5dd1506c1e4a67052db61800aed721" }

@@ -11,6 +11,7 @@
 use crate::audio::Speaker;
 use crate::config::{Config, Summaries};
 use crate::export;
+use crate::inhibit::Awake;
 use crate::llm::{self, Llm, Scope, clock};
 use crate::session::{Event, Line, Recording};
 use crate::store::{self, Card, Meeting, Mode, Turn};
@@ -297,6 +298,8 @@ pub struct Ui {
     notes: TextEdit,
     view: View,
     rec: Rec,
+    /// Keeps the screen awake while `rec` is live (released by `stop_recording`, `Finished` and `relaunch`).
+    awake: Awake,
     /// The app clock, in seconds, as of the last poll.
     now: f64,
     events: (Sender<Event>, Receiver<Event>),
@@ -368,6 +371,7 @@ impl Ui {
             notes,
             view: View::Transcript,
             rec: Rec::Idle,
+            awake: Awake::system(),
             now: 0.0,
             events: mpsc::channel(),
             llm: mpsc::channel(),
@@ -601,6 +605,7 @@ impl Ui {
             return; // something did not save: stay, and show why
         }
         use std::os::unix::process::CommandExt;
+        self.awake.set(false);
         let e = std::process::Command::new(&target).args(std::env::args_os().skip(1)).exec();
         self.warn(format!("Could not start the new version: {e}"));
     }
@@ -879,6 +884,7 @@ impl Ui {
         ) {
             Ok(handle) => {
                 self.rec = Rec::Live { handle: Some(handle), t0: self.now, offset_ms, file };
+                self.awake.set(true);
                 self.view = View::Transcript;
                 self.status = None;
                 if let Some(c) = &self.capsule {
@@ -891,6 +897,8 @@ impl Ui {
 
     fn stop_recording(&mut self) {
         let end_ms = self.elapsed_ms();
+        // The class is over: let the screen lock again while the transcript finishes.
+        self.awake.set(false);
         if let Rec::Live { handle, offset_ms, file, .. } = std::mem::replace(&mut self.rec, Rec::Idle) {
             if let Some(h) = handle {
                 h.stop();
@@ -1186,6 +1194,7 @@ impl Ui {
                 }
                 Event::Finished => {
                     self.rec = Rec::Idle;
+                    self.awake.set(false);
                     if !self.status.as_ref().is_some_and(|s| s.1) {
                         self.status = None;
                     }
@@ -3588,6 +3597,27 @@ mod tests {
         ui.summarizing = None;
         ui.download = Some(Download { what: Fetch::Llm, have: 0, total: 0, cancel: Arc::new(AtomicBool::new(false)) });
         assert!(ui.update_blocker().is_some());
+    }
+
+    #[test]
+    fn the_screen_is_kept_awake_only_while_the_recording_is_live() {
+        let mut ui = Ui::new(None);
+        ui.demo = true;
+        let live = || Rec::Live { handle: None, t0: 0.0, offset_ms: 0, file: PathBuf::from("/x.md") };
+        // Stop: released as soon as the recording stops, while the transcript still finishes.
+        ui.rec = live();
+        ui.awake.set(true);
+        assert!(ui.awake.held());
+        ui.stop_recording();
+        assert!(matches!(ui.rec, Rec::Finishing { .. }));
+        assert!(!ui.awake.held());
+        // Finished: released even if it arrives while still live (a session that ended by itself).
+        ui.rec = live();
+        ui.awake.set(true);
+        ui.events.0.send(Event::Finished).unwrap();
+        ui.drain();
+        assert!(matches!(ui.rec, Rec::Idle));
+        assert!(!ui.awake.held());
     }
 
     #[test]
