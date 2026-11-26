@@ -1313,6 +1313,8 @@ dependencies = [
  "sha2",
  "transcribe-cpp",
  "ureq",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

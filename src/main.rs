@@ -8,6 +8,7 @@
 mod audio;
 mod config;
 mod export;
+mod inhibit;
 mod llm;
 mod models;
 mod ollama;
